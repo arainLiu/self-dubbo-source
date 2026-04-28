@@ -563,7 +563,21 @@ public class ServiceConfig<T> extends ServiceConfigBase<T> {
         checkAndUpdateSubConfigs();
     }
 
+    /**
+     * 执行服务导出操作，将服务暴露给外部调用者。
+     * <p>
+     * 该方法会检查服务的导出状态，如果服务已经取消导出则抛出异常；
+     * 如果服务已经导出则直接返回，避免重复导出。
+     * 如果路径未配置，则使用接口名称作为路径。
+     * </p>
+     *
+     * @param registerType 注册类型，决定服务是否注册以及何时注册到注册中心。
+     *                     可选值包括：NEVER_REGISTER（永不注册）、MANUAL_REGISTER（手动注册）、
+     *                     AUTO_REGISTER_BY_DEPLOYER（部署器自动注册）、AUTO_REGISTER（自动注册）
+     * @throws IllegalStateException 当服务已经取消导出时尝试再次导出会抛出此异常
+     */
     protected synchronized void doExport(RegisterTypeEnum registerType) {
+        //检查服务导出状态：如果服务已取消导出则抛出异常，如果已导出则直接返回
         if (unexported) {
             throw new IllegalStateException("The service " + interfaceClass.getName() + " has already unexported!");
         }
@@ -571,10 +585,13 @@ public class ServiceConfig<T> extends ServiceConfigBase<T> {
             return;
         }
 
+        //设置服务路径：如果未配置路径则使用接口名称作为默认路径
         if (StringUtils.isEmpty(path)) {
             path = interfaceName;
         }
+        // 进行接口级注册和将应用级数据添加到缓存
         doExportUrls(registerType);
+        //将映射数据进行注册
         exported();
     }
 
@@ -606,7 +623,7 @@ public class ServiceConfig<T> extends ServiceConfigBase<T> {
 
         providerModel.setDestroyRunner(getDestroyRunner());
         repository.registerProvider(providerModel);
-
+        //这里接口级注册和应用级注册有区别
         List<URL> registryURLs = !Boolean.FALSE.equals(isRegister())
                 ? ConfigValidationUtils.loadRegistries(this, true)
                 : Collections.emptyList();
@@ -974,22 +991,70 @@ public class ServiceConfig<T> extends ServiceConfigBase<T> {
         return url;
     }
 
+    /**
+     * 执行单个URL的服务导出操作，完成服务代理的创建和协议暴露。
+     * <p>
+     * 该方法是Dubbo服务导出的核心执行单元，负责将服务引用转换为可被远程调用的Exporter对象。
+     * 主要处理流程包括注册类型判断、Invoker代理创建、元数据包装和协议层导出。
+     * </p>
+     * <p>
+     * 注册类型控制逻辑：
+     * <ul>
+     *   <li>如果URL中REGISTER参数为false，强制转换为MANUAL_REGISTER模式</li>
+     *   <li>对于NEVER_REGISTER、MANUAL_REGISTER、AUTO_REGISTER_BY_DEPLOYER三种模式，在URL中设置REGISTER=false</li>
+     *   <li>AUTO_REGISTER模式会在服务导出时立即向注册中心注册地址</li>
+     * </ul>
+     * </p>
+     *
+     * @param url           服务导出的完整URL地址，包含协议、主机、端口、参数等所有必要信息
+     * @param withMetaData  是否需要包装服务元数据，true时会使用DelegateProviderMetaDataInvoker包装原始Invoker
+     * @param registerType  注册类型，控制服务的注册时机和行为
+     *                      <ul>
+     *                        <li>NEVER_REGISTER - 永不自动注册，只能通过QoS等命令手动注册</li>
+     *                        <li>MANUAL_REGISTER - 手动注册，默认不注册但可通过命令触发</li>
+     *                        <li>AUTO_REGISTER_BY_DEPLOYER - 部署器自动注册，延迟到应用启动完成后注册</li>
+     *                        <li>AUTO_REGISTER - 立即自动注册，服务导出时同步向注册中心注册</li>
+     *                      </ul>
+     */
     @SuppressWarnings({"unchecked", "rawtypes"})
     private void doExportUrl(URL url, boolean withMetaData, RegisterTypeEnum registerType) {
+        /*
+         * 根据URL中的REGISTER参数修正注册类型：
+         * 当显式设置register=false时，降级为手动注册模式
+         */
         if (!url.getParameter(REGISTER_KEY, true)) {
             registerType = RegisterTypeEnum.MANUAL_REGISTER;
         }
+        /*
+         * 对于非自动注册模式，在URL中标记REGISTER=false，阻止RegistryProtocol自动注册
+         */
         if (registerType == RegisterTypeEnum.NEVER_REGISTER
                 || registerType == RegisterTypeEnum.MANUAL_REGISTER
                 || registerType == RegisterTypeEnum.AUTO_REGISTER_BY_DEPLOYER) {
             url = url.addParameter(REGISTER_KEY, false);
         }
 
+        /*
+         * 创建服务调用器（Invoker）：
+         * 通过ProxyFactory将服务引用对象包装为Invoker，支持多种代理方式（JDK动态代理、Javassist等）
+         */
         Invoker<?> invoker = proxyFactory.getInvoker(ref, (Class) interfaceClass, url);
         if (withMetaData) {
+            /*
+             * 包装元数据代理：
+             * DelegateProviderMetaDataInvoker在服务调用基础上附加服务配置元数据，用于元数据中心上报
+             */
             invoker = new DelegateProviderMetaDataInvoker(invoker, this);
         }
+        /*
+         * 协议层导出：
+         * 通过Protocol SPI机制调用对应的协议实现（如DubboProtocol、InjvmProtocol）进行服务暴露
+         */
         Exporter<?> exporter = protocolSPI.export(invoker);
+        /*
+         * 缓存Exporter对象：
+         * 按注册类型分组存储，便于后续按类型进行unexport操作
+         */
         ConcurrentHashMapUtils.computeIfAbsent(exporters, registerType, k -> new CopyOnWriteArrayList<>())
                 .add(exporter);
     }

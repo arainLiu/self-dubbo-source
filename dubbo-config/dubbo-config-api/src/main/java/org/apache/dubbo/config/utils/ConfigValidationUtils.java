@@ -196,6 +196,32 @@ public class ConfigValidationUtils {
 
     public static final String IPV6_END_MARK = "]";
 
+    /**
+     * 加载注册中心配置并转换为URL列表。
+     * <p>
+     * 该方法是Dubbo3服务注册与发现机制的核心入口，负责将配置化的注册中心信息解析为可执行的URL地址列表。
+     * 支持多注册中心、地址自动刷新、以及基于角色的注册/订阅过滤。
+     * </p>
+     * <p>
+     * 主要处理流程：
+     * 1. 配置刷新：确保通过API直接设置的注册中心配置能够生效
+     * 2. 地址解析：将注册地址解析为标准URL格式，附加必要的元数据参数
+     * 3. 角色过滤：根据提供者/消费者角色，分别过滤需要注册或订阅的地址
+     * 4. 兼容性处理：生成接口级别的兼容地址，支持双注册模式（应用级+接口级）
+     * </p>
+     *
+     * @param interfaceConfig 接口配置对象，包含应用配置、模块配置和注册中心配置等上下文信息
+     * @param provider        是否为服务提供者
+     *                        <ul>
+     *                          <li>true - 服务提供者，需要向注册中心注册地址</li>
+     *                          <li>false - 服务消费者，需要从注册中心订阅地址</li>
+     *                        </ul>
+     * @return 注册中心URL列表，经过兼容性处理后可能包含多个注册中心地址
+     *         <ul>
+     *           <li>对于提供者：返回需要注册的注册中心地址列表</li>
+     *           <li>对于消费者：返回需要订阅的注册中心地址列表</li>
+     *         </ul>
+     */
     public static List<URL> loadRegistries(AbstractInterfaceConfig interfaceConfig, boolean provider) {
         // check && override if necessary
         List<URL> registryList = new ArrayList<>();
@@ -203,6 +229,10 @@ public class ConfigValidationUtils {
         List<RegistryConfig> registries = interfaceConfig.getRegistries();
         if (CollectionUtils.isNotEmpty(registries)) {
             for (RegistryConfig config : registries) {
+                /*
+                 * 配置刷新机制：
+                 * 当用户通过config.setRegistries()直接设置配置时，需要手动触发refresh以确保参数生效
+                 */
                 // try to refresh registry in case it is set directly by user using config.setRegistries()
                 if (!config.isRefreshed()) {
                     config.refresh();
@@ -212,6 +242,10 @@ public class ConfigValidationUtils {
                     address = ANYHOST_VALUE;
                 }
                 if (!RegistryConfig.NO_AVAILABLE.equalsIgnoreCase(address)) {
+                    /*
+                     * 构建注册中心URL的参数映射：
+                     * 按照优先级依次添加应用级参数、注册中心级别参数、运行时参数
+                     */
                     Map<String, String> map = new HashMap<>();
                     AbstractConfig.appendParameters(map, application);
                     AbstractConfig.appendParameters(map, config);
@@ -220,6 +254,10 @@ public class ConfigValidationUtils {
                     if (!map.containsKey(PROTOCOL_KEY)) {
                         map.put(PROTOCOL_KEY, DUBBO_PROTOCOL);
                     }
+                    /*
+                     * 构建注册中心集群标识：
+                     * 格式为 {registryId}:{namespace}，用于区分不同命名空间的注册中心实例
+                     */
                     String registryCluster = config.getId();
                     if (isEmpty(registryCluster)) {
                         registryCluster = DEFAULT_KEY;
@@ -230,6 +268,12 @@ public class ConfigValidationUtils {
                     map.put(REGISTRY_CLUSTER_KEY, registryCluster);
                     List<URL> urls = UrlUtils.parseURLs(address, map);
 
+                    /*
+                     * URL转换与角色过滤：
+                     * 1. 将原始协议转换为注册中心协议（如zookeeper:// -> registry://）
+                     * 2. 根据provider/consumer角色分别处理REGISTER/SUBSCRIBE标志
+                     * 3. 提供者的延迟注册状态会在RegistryProtocol#export中进一步检查
+                     */
                     for (URL url : urls) {
                         url = URLBuilder.from(url)
                                 .addParameter(REGISTRY_KEY, url.getProtocol())
@@ -247,16 +291,53 @@ public class ConfigValidationUtils {
                 }
             }
         }
+        /*
+         * 兼容性处理：
+         * 在Dubbo3的应用级服务发现模式下，自动生成接口级别的兼容地址
+         * 支持三种注册模式：instance（仅应用级）、interface（仅接口级）、all（双注册）
+         */
         return genCompatibleRegistries(interfaceConfig.getScopeModel(), registryList, provider);
     }
 
+    /**
+     * 生成兼容性注册中心地址列表，支持Dubbo3应用级服务发现与接口级服务发现的平滑过渡。
+     * <p>
+     * 该方法是Dubbo3双注册机制的核心实现，负责根据注册模式生成不同级别的服务地址：
+     * </p>
+     * <ul>
+     *   <li><b>应用级注册（instance）</b>：使用 SERVICE_REGISTRY_PROTOCOL 协议，注册应用维度的服务实例</li>
+     *   <li><b>接口级注册（interface）</b>：使用 REGISTRY_PROTOCOL 协议，注册接口维度的服务地址</li>
+     *   <li><b>双注册模式（all）</b>：同时注册应用级和接口级地址，保证新旧版本客户端的兼容性</li>
+     * </ul>
+     * <p>
+     * 处理逻辑：
+     * <br>1. 对于应用级注册中心（service-discovery://），默认仅进行应用级注册，可根据配置补充接口级注册
+     * <br>2. 对于传统注册中心（zookeeper://等），默认进行双注册，可根据配置精简为单一模式
+     * <br>3. 通过 register.mode 参数控制注册行为，支持全局配置和注册中心级别配置
+     * <br>4. 消费者场景下直接返回原始地址，不进行兼容性转换
+     * </p>
+     *
+     * @param scopeModel    作用域模型，用于获取应用级别的配置信息和Bean容器
+     * @param registryList  原始注册中心URL列表，已经过初步解析和过滤
+     * @param provider      是否为服务提供者，true时执行兼容性转换，false时直接返回原列表
+     * @return 经过兼容性处理的注册中心URL列表，可能包含应用级、接口级或两者混合的地址
+     */
     private static List<URL> genCompatibleRegistries(ScopeModel scopeModel, List<URL> registryList, boolean provider) {
         List<URL> result = new ArrayList<>(registryList.size());
         registryList.forEach(registryURL -> {
             if (provider) {
+                /*
+                 * 确定注册模式并生成兼容地址：
+                 * 根据注册中心类型和register.mode配置，决定采用何种注册策略
+                 */
                 // for registries enabled service discovery, automatically register interface compatible addresses.
                 String registerMode;
                 if (SERVICE_REGISTRY_PROTOCOL.equals(registryURL.getProtocol())) {
+                    /*
+                     * 应用级注册中心（service-discovery://）的处理逻辑：
+                     * 默认采用 instance 模式，仅注册应用级服务
+                     * 配置为 all 模式时，额外生成接口级兼容地址
+                     */
                     registerMode = registryURL.getParameter(
                             REGISTER_MODE_KEY,
                             ConfigurationUtils.getCachedDynamicProperty(
@@ -267,6 +348,7 @@ public class ConfigValidationUtils {
                     result.add(registryURL);
                     if (DEFAULT_REGISTER_MODE_ALL.equalsIgnoreCase(registerMode)
                             && registryNotExists(registryURL, registryList, REGISTRY_PROTOCOL)) {
+                        //构建 service-discovery-registry
                         URL interfaceCompatibleRegistryURL = URLBuilder.from(registryURL)
                                 .setProtocol(REGISTRY_PROTOCOL)
                                 .removeParameter(REGISTRY_TYPE_KEY)
@@ -274,6 +356,11 @@ public class ConfigValidationUtils {
                         result.add(interfaceCompatibleRegistryURL);
                     }
                 } else {
+                    /*
+                     * 传统注册中心（zookeeper://、nacos://等）的处理逻辑：
+                     * 默认采用 all 模式，同时注册应用级和接口级服务
+                     * 可配置为 instance 或 interface 模式进行精简
+                     */
                     registerMode = registryURL.getParameter(
                             REGISTER_MODE_KEY,
                             ConfigurationUtils.getCachedDynamicProperty(
@@ -297,6 +384,9 @@ public class ConfigValidationUtils {
                     }
                 }
 
+                /*
+                 * 上报注册状态到框架监控服务，用于运维监控和故障诊断
+                 */
                 FrameworkStatusReportService reportService = ScopeModelUtil.getApplicationModel(scopeModel)
                         .getBeanFactory()
                         .getBean(FrameworkStatusReportService.class);
