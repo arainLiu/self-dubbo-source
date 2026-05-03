@@ -237,17 +237,49 @@ public class RegistryProtocol implements Protocol, ScopeModelAware {
         return map;
     }
 
+    /**
+     * 向注册中心注册服务提供者地址，并上报注册指标事件。
+     * <p>
+     * 该方法封装了注册中心的核心注册逻辑，包括部署器状态管理、注册中心名称解析和监控指标上报。
+     * 通过ApplicationDeployer的计数器机制，确保在并发场景下服务导出状态的准确性。
+     * </p>
+     * <p>
+     * 注册流程：
+     * <ol>
+     *   <li><b>部署器计数</b>：增加服务刷新计数，用于跟踪应用启动过程中的服务导出进度</li>
+     *   <li><b>注册中心名称提取</b>：从Registry URL中解析注册中心标识，优先使用REGISTRY_CLUSTER_KEY参数</li>
+     *   <li><b>指标上报</b>：通过MetricsEventBus发布RegistryEvent事件，记录服务注册到指定注册中心的指标数据</li>
+     *   <li><b>执行注册</b>：调用Registry.register方法将服务地址写入注册中心（如Zookeeper节点创建）</li>
+     *   <li><b>计数释放</b>：在finally块中减少服务刷新计数，确保异常情况下也能正确释放资源</li>
+     * </ol>
+     * </p>
+     *
+     * @param registry              注册中心实例，可以是ZookeeperRegistry、NacosRegistry等具体实现
+     * @param registeredProviderUrl 需要注册的服务提供者URL，包含服务接口、协议、地址、端口等完整信息
+     */
     private static void register(Registry registry, URL registeredProviderUrl) {
         ApplicationDeployer deployer =
                 registeredProviderUrl.getOrDefaultApplicationModel().getDeployer();
         try {
+            /*
+             * 增加服务刷新计数：
+             * 用于ApplicationDeployer跟踪服务导出进度，判断应用是否完成所有服务的初始化
+             */
             deployer.increaseServiceRefreshCount();
+            /*
+             * 解析注册中心名称：
+             * 优先级顺序：REGISTRY_CLUSTER_KEY参数 > 服务发现URL的REGISTRY_KEY参数 > 协议名称 > "unknown"
+             */
             String registryName = Optional.ofNullable(registry.getUrl())
                     .map(u -> u.getParameter(
                             RegistryConstants.REGISTRY_CLUSTER_KEY,
                             UrlUtils.isServiceDiscoveryURL(u) ? u.getParameter(REGISTRY_KEY) : u.getProtocol()))
                     .filter(StringUtils::isNotEmpty)
                     .orElse("unknown");
+            /*
+             * 发布注册指标事件：
+             * 通过MetricsEventBus上报服务注册成功的事件，用于运维监控和统计分析
+             */
             MetricsEventBus.post(
                     RegistryEvent.toRsEvent(
                             registeredProviderUrl.getApplicationModel(),
@@ -259,6 +291,10 @@ public class RegistryProtocol implements Protocol, ScopeModelAware {
                         return null;
                     });
         } finally {
+            /*
+             * 减少服务刷新计数：
+             * 无论注册成功或失败，都需要释放计数器，避免内存泄漏
+             */
             deployer.decreaseServiceRefreshCount();
         }
     }
@@ -268,12 +304,39 @@ public class RegistryProtocol implements Protocol, ScopeModelAware {
         model.addStatedUrl(new ProviderModel.RegisterStatedURL(registeredProviderUrl, registryUrl, registered));
     }
 
+    /**
+     * 导出服务到注册中心，完成服务注册、本地暴露和配置监听的完整流程。
+     * <p>
+     * 该方法是Dubbo服务导出的核心入口（RegistryProtocol层面），负责将已经在本地的协议层Exporter进一步注册到注册中心，
+     * 并建立配置监听机制以支持动态配置覆盖和服务治理规则。
+     * </p>
+     * <p>
+     * 主要处理流程：
+     * <ol>
+     *   <li><b>配置订阅</b>：创建OverrideListener监听器，订阅服务级别的配置覆盖规则（如权重、超时等动态调整）</li>
+     *   <li><b>本地导出</b>：调用doLocalExport将Invoker导出为本地Exporter，绑定到具体协议端口</li>
+     *   <li><b>注册中心交互</b>：获取Registry实例，根据register标志决定是否向注册中心注册地址</li>
+     *   <li><b>状态管理</b>：在ProviderModel中注册StatedUrl，跟踪服务的注册状态</li>
+     *   <li><b>兼容处理</b>：对于2.6.x版本的配置监听进行兼容性处理（已废弃）</li>
+     *   <li><b>事件通知</b>：触发RegistryProtocolListener监听器，通知服务导出完成</li>
+     * </ol>
+     * </p>
+     *
+     * @param originInvoker 原始调用器，包含服务引用的所有元数据信息（地址、参数、服务模型等）
+     * @return 可销毁的Exporter包装对象，每次调用都会返回新的实例以避免重复导出
+     * @throws RpcException RPC异常，当注册中心连接失败、服务导出异常时抛出
+     */
     @Override
     public <T> Exporter<T> export(final Invoker<T> originInvoker) throws RpcException {
         URL registryUrl = getRegistryUrl(originInvoker);
         // url to export locally
         URL providerUrl = getProviderUrl(originInvoker);
 
+        /*
+         * 配置覆盖监听机制：
+         * 订阅服务级别的动态配置规则（如通过Admin控制台下发的权重调整、超时设置等）
+         * FIXME: 存在缓存key冲突问题，同一JVM内暴露和调用相同服务时会相互覆盖
+         */
         // Subscribe the override data
         // FIXME When the provider subscribes, it will affect the scene : a certain JVM exposes the service and call
         //  the same service. Because the subscribed is cached key with the name of the service, it causes the
@@ -285,21 +348,36 @@ public class RegistryProtocol implements Protocol, ScopeModelAware {
         ConcurrentHashMapUtils.computeIfAbsent(overrideListeners, overrideSubscribeUrl, k -> new ConcurrentHashSet<>())
                 .add(overrideSubscribeListener);
 
+        /*
+         * 应用配置覆盖规则：
+         * 依次应用全局配置和服务级别配置，可能修改providerUrl中的参数值
+         */
         providerUrl = overrideUrlWithConfig(providerUrl, overrideSubscribeListener);
-        // export invoker
+        /*
+         * 1. 暴漏本地业务服务：
+         * 将Invoker包装为Exporter，绑定到具体协议端口（如dubbo://192.168.1.100:20880）
+         * 使用缓存机制避免同一服务的重复导出
+         */
         final ExporterChangeableWrapper<T> exporter = doLocalExport(originInvoker, providerUrl);
 
-        // url to registry
+        /*
+         * 2. 获取注册register：
+         *   - 1. 获取Registry实例（可能是ZookeeperRegistry、NacosRegistry等）
+         *   - 2. 定制注册地址，合并注册中心的特定参数
+         *   - 3. 根据双重REGISTER标志决定是否立即注册（providerUrl和registryUrl都需为true）
+         */
         final Registry registry = getRegistry(registryUrl);
         final URL registeredProviderUrl = customizeURL(providerUrl, registryUrl);
 
         // decide if we need to delay publish (provider itself and registry should both need to register)
         boolean register = providerUrl.getParameter(REGISTER_KEY, true) && registryUrl.getParameter(REGISTER_KEY, true);
         if (register) {
+            //key3:这里有两种情况 接口级注册会将接口级服务提供者数据直接注册到zookeeper上面，
+            //服务发现(应用级注册)这里仅仅会将注册数据转换为服务元数据等后面来发布元数据
             register(registry, registeredProviderUrl);
         }
 
-        // register stated url on provider model
+        //注册状态管理：在ProviderModel中记录服务的注册状态，用于后续的服务治理和监控
         registerStatedUrl(registryUrl, registeredProviderUrl, register);
 
         exporter.setRegisterUrl(registeredProviderUrl);
@@ -313,11 +391,15 @@ public class RegistryProtocol implements Protocol, ScopeModelAware {
                 .getConfiguration()
                 .convert(Boolean.class, ENABLE_26X_CONFIGURATION_LISTEN, true)) {
             if (!registry.isServiceDiscovery()) {
-                // Deprecated! Subscribe to override rules in 2.6.x or before.
+                /*
+                 * Dubbo 2.6.x兼容逻辑（已废弃）：
+                 * 对于非应用级服务发现的注册中心，订阅旧版本的override规则
+                 */
                 registry.subscribe(overrideSubscribeUrl, overrideSubscribeListener);
             }
         }
 
+        //触发导出事件通知：调用所有注册的RegistryProtocolListener监听器，用于扩展点逻辑
         notifyExport(exporter);
         // Ensure that a new exporter instance is returned every time export
         return new DestroyableExporter<>(exporter);
@@ -552,18 +634,53 @@ public class RegistryProtocol implements Protocol, ScopeModelAware {
         return registryUrl.removeParameters(DYNAMIC_KEY, ENABLED_KEY).toFullString();
     }
 
+    /**
+     * 从注册中心引用远程服务，创建具备集群容错能力的Invoker对象。
+     * <p>
+     * 该方法是Dubbo服务消费者通过注册中心获取提供者列表的核心入口，负责根据配置参数选择合适的Cluster策略，
+     * 并创建对应的MigrationInvoker支持应用级和接口级服务发现的平滑迁移。
+     * </p>
+     * <p>
+     * 主要处理流程：
+     * <ol>
+     *   <li><b>URL转换</b>：调用getRegistryUrl将原始URL转换为registry://协议的注册中心地址</li>
+     *   <li><b>特殊类型处理</b>：如果引用的是RegistryService接口本身，直接返回Registry的代理对象，无需集群逻辑</li>
+     *   <li><b>分组配置解析</b>：从REFER_KEY属性中提取group参数，判断是否为多分组或通配符模式</li>
+     *   <li><b>多分组处理</b>：当group包含多个值（逗号分隔）或使用通配符"*"时，使用MergeableCluster合并多个分组的结果</li>
+     *   <li><b>普通场景</b>：对于单分组场景，使用配置的cluster策略（默认Failover）创建Invoker</li>
+     *   <li><b>委托执行</b>：调用doRefer完成ConsumerURL构建、MigrationInvoker创建和监听器拦截</li>
+     * </ol>
+     * </p>
+     *
+     * @param type 服务接口类型，即消费者引用的服务接口Class对象
+     * @param url  注册中心URL，包含注册地址、协议类型、分组配置、集群策略等所有引用所需的参数
+     * @return 具备集群容错能力的Invoker对象，可能是ServiceDiscoveryMigrationInvoker或普通的ClusterInvoker
+     * @throws RpcException RPC异常，当注册中心连接失败、服务不可用或配置错误时抛出
+     */
     @Override
     @SuppressWarnings("unchecked")
     public <T> Invoker<T> refer(Class<T> type, URL url) throws RpcException {
         url = getRegistryUrl(url);
         Registry registry = getRegistry(url);
+        /*
+         * RegistryService特殊处理：
+         * 当直接引用RegistryService时，无需集群和路由逻辑，直接返回Registry实例的代理
+         */
         if (RegistryService.class.equals(type)) {
             return proxyFactory.getInvoker((T) registry, type, url);
         }
 
+        /*
+         * 提取引用参数：
+         * REFER_KEY属性中存储了ReferenceConfig传递的所有消费端配置参数
+         */
         // group="a,b" or group="*"
         Map<String, String> qs = (Map<String, String>) url.getAttribute(REFER_KEY);
         String group = qs.get(GROUP_KEY);
+        /*
+         * 多分组场景判断：
+         * 当配置了group="a,b"（多个分组）或group="*"（所有分组）时，使用MergeableCluster合并结果
+         */
         if (StringUtils.isNotEmpty(group)) {
             if ((COMMA_SPLIT_PATTERN.split(group)).length > 1 || "*".equals(group)) {
                 return doRefer(
@@ -571,15 +688,53 @@ public class RegistryProtocol implements Protocol, ScopeModelAware {
             }
         }
 
+        /*
+         * 单分组场景：
+         * 使用配置的cluster策略（如failover、failsafe等），未配置时使用默认的FailoverCluster
+         */
         Cluster cluster = Cluster.getCluster(url.getScopeModel(), qs.get(CLUSTER_KEY));
         return doRefer(cluster, registry, type, url, qs);
     }
 
+    /**
+     * 执行服务引用的核心逻辑，构建消费者URL并创建支持迁移的ClusterInvoker。
+     * <p>
+     * 该方法是RegistryProtocol.refer的实际执行者，负责将注册中心URL和引用参数转换为具备服务发现迁移能力的Invoker对象。
+     * 通过ServiceDiscoveryMigrationInvoker实现应用级服务发现和接口级服务发现的无缝切换，支持Dubbo3的平滑升级。
+     * </p>
+     * <p>
+     * 主要处理流程：
+     * <ol>
+     *   <li><b>属性复制</b>：从注册中心URL复制所有属性到consumerAttribute，移除REFER_KEY避免循环引用</li>
+     *   <li><b>协议确定</b>：优先使用parameters中的PROTOCOL_KEY，未配置时使用CONSUMER作为默认协议</li>
+     *   <li><b>消费者URL构建</b>：创建consumer://协议的URL，携带消费端IP、接口名、配置参数等元数据信息</li>
+     *   <li><b>属性关联</b>：将consumerUrl存储到url的CONSUMER_URL_KEY属性中，便于后续路由和负载均衡使用</li>
+     *   <li><b>MigrationInvoker创建</b>：调用getMigrationInvoker生成ServiceDiscoveryMigrationInvoker，支持三种集群模式切换</li>
+     *   <li><b>监听器拦截</b>：调用interceptInvoker触发RegistryProtocolListener，允许扩展点修改Invoker行为（如动态规则监听）</li>
+     * </ol>
+     * </p>
+     *
+     * @param cluster   集群策略实现，如FailoverCluster、ZoneAwareCluster、MergeableCluster等，决定多个提供者的调用方式
+     * @param registry  注册中心实例，用于查询提供者列表和订阅配置变更
+     * @param type      服务接口类型，即消费者引用的服务接口Class对象
+     * @param url       注册中心URL，格式为registry://registry-address，包含注册中心连接信息和订阅参数
+     * @param parameters 引用配置参数Map，包含group、version、cluster、timeout等所有消费端配置
+     * @return 经过拦截器处理的ClusterInvoker对象，具备服务发现迁移和动态规则控制能力
+     */
     protected <T> Invoker<T> doRefer(
             Cluster cluster, Registry registry, Class<T> type, URL url, Map<String, String> parameters) {
         Map<String, Object> consumerAttribute = new HashMap<>(url.getAttributes());
+        /*
+         * 移除REFER_KEY避免循环引用：
+         * consumerUrl中不需要存储refer参数，因为已经展开为独立的URL参数
+         */
         consumerAttribute.remove(REFER_KEY);
         String p = isEmpty(parameters.get(PROTOCOL_KEY)) ? CONSUMER : parameters.get(PROTOCOL_KEY);
+        /*
+         * 构建消费者URL：
+         * consumer://协议用于标识消费端身份，在元数据中心和服务治理中使用
+         * 格式：consumer://consumer-ip/interface?parameters
+         */
         URL consumerUrl = new ServiceConfigURL(
                 p,
                 null,
@@ -589,8 +744,20 @@ public class RegistryProtocol implements Protocol, ScopeModelAware {
                 getPath(parameters, type),
                 parameters,
                 consumerAttribute);
+        /*
+         * 关联消费者URL到注册中心URL：
+         * 后续Directory在订阅和路由时会用到consumerUrl中的配置
+         */
         url = url.putAttribute(CONSUMER_URL_KEY, consumerUrl);
+        /*
+         * 创建支持迁移的Invoker：
+         * ServiceDiscoveryMigrationInvoker封装了应用级和接口级两种服务发现模式，可根据配置动态切换
+         */
         ClusterInvoker<T> migrationInvoker = getMigrationInvoker(this, cluster, registry, type, url, consumerUrl);
+        /*
+         * 触发监听器拦截：
+         * 允许RegistryProtocolListener（如MigrationRuleListener）修改Invoker的行为和状态
+         */
         return interceptInvoker(migrationInvoker, url, consumerUrl);
     }
 
@@ -609,23 +776,49 @@ public class RegistryProtocol implements Protocol, ScopeModelAware {
     }
 
     /**
-     * This method tries to load all RegistryProtocolListener definitions, which are used to control the behaviour of invoker by interacting with defined, then uses those listeners to
-     * change the status and behaviour of the MigrationInvoker.
+     * 通过RegistryProtocolListener监听器拦截Invoker，实现服务引用行为的动态控制。
      * <p>
-     * Currently available Listener is MigrationRuleListener, one used to control the Migration behaviour with dynamically changing rules.
+     * 该方法是Dubbo服务治理扩展机制的核心入口，负责加载并触发所有注册的RegistryProtocolListener，
+     * 允许在服務引用阶段动态修改MigrationInvoker的行为和状态。典型应用场景包括服务迁移规则控制、
+     * 动态配置监听、流量路由策略调整等。
+     * </p>
+     * <p>
+     * 主要处理流程：
+     * <ol>
+     *   <li><b>查找监听器</b>：通过SPI机制查找所有激活的RegistryProtocolListener实现类</li>
+     *   <li><b>空值优化</b>：如果没有找到任何监听器，直接返回原始Invoker，避免不必要的性能开销</li>
+     *   <li><b>触发回调</b>：遍历所有监听器，依次调用onRefer方法，传入invoker、consumerUrl和registryUrl供监听器使用</li>
+     *   <li><b>行为修改</b>：监听器可以在onRefer中修改invoker的状态（如设置强制应用级模式）、注册配置监听器等</li>
+     *   <li><b>返回Invoker</b>：返回经过所有监听器处理后的最终Invoker对象</li>
+     * </ol>
+     * </p>
+     * <p>
+     * 典型监听器示例：
+     * <ul>
+     *   <li><b>MigrationRuleListener</b>：监听动态下发的服务迁移规则，根据规则切换应用级/接口级服务发现模式</li>
+     *   <li><b>自定义监听器</b>：用户可通过SPI扩展实现自定义的服务引用拦截逻辑</li>
+     * </ul>
+     * </p>
      *
-     * @param invoker     MigrationInvoker that determines which type of invoker list to use
-     * @param url         The original url generated during refer, more like a registry:// style url
-     * @param consumerUrl Consumer url representing current interface and its config
-     * @param <T>         The service definition
-     * @return The @param MigrationInvoker passed in
+     * @param invoker     集群Invoker对象，通常是ServiceDiscoveryMigrationInvoker，支持多种服务发现模式切换
+     * @param url         注册中心URL，格式为registry://registry-address，包含订阅参数和消费者配置
+     * @param consumerUrl 消费者URL，格式为consumer://consumer-ip/interface，代表当前接口的消费端身份和配置
+     * @return 经过监听器处理后的Invoker对象，可能被修改了行为状态或注册了额外的监听器
      */
     protected <T> Invoker<T> interceptInvoker(ClusterInvoker<T> invoker, URL url, URL consumerUrl) {
         List<RegistryProtocolListener> listeners = findRegistryProtocolListeners(url);
+        /*
+         * 快速返回优化：
+         * 没有监听器时直接返回，避免空循环
+         */
         if (CollectionUtils.isEmpty(listeners)) {
             return invoker;
         }
 
+        /*
+         * 触发监听器回调：
+         * 每个监听器可以访问并修改invoker的状态，实现动态服务治理逻辑
+         */
         for (RegistryProtocolListener listener : listeners) {
             listener.onRefer(this, invoker, consumerUrl, url);
         }
@@ -644,10 +837,38 @@ public class RegistryProtocol implements Protocol, ScopeModelAware {
         return doCreateInvoker(directory, cluster, registry, type);
     }
 
+    /**
+     * 创建集群Invoker，完成Directory初始化、消费者注册和订阅的完整流程。
+     * <p>
+     * 该方法是Dubbo服务消费者通过注册中心引用的核心执行单元，负责将DynamicDirectory（动态目录）与Cluster（集群策略）结合，
+     * 生成具备路由、负载均衡和故障转移能力的ClusterInvoker。支持接口级和服务发现两种Directory类型。
+     * </p>
+     * <p>
+     * 主要处理流程：
+     * <ol>
+     *   <li><b>设置依赖</b>：为Directory注入Registry实例和Protocol协议，用于后续的地址订阅和Invoker创建</li>
+     *   <li><b>构建注册URL</b>：从ConsumerUrl提取参数，构造consumer://协议的urlToRegistry，携带消费端身份标识（IP、接口名、配置参数）</li>
+     *   <li><b>消费者注册</b>：如果directory配置了shouldRegister=true，将消费者URL写入注册中心，使得提供者能够感知到谁在调用自己（用于服务治理和监控）</li>
+     *   <li><b>构建路由链</b>：调用buildRouterChain加载所有激活的路由规则（如条件路由、标签路由、脚本路由等），用于后续请求过滤</li>
+     *   <li><b>订阅提供者列表</b>：调用subscribe订阅providers/configurators/routers等节点，监听提供者地址变更和动态配置推送</li>
+     *   <li><b>集群包装</b>：调用cluster.join将Directory包装为ClusterInvoker，实现多提供者的统一调用入口</li>
+     * </ol>
+     * </p>
+     *
+     * @param directory 动态目录对象，可以是RegistryDirectory（接口级）或ServiceDiscoveryRegistryDirectory（应用级），负责管理提供者地址列表
+     * @param cluster   集群策略实现，如FailoverCluster、FailsafeCluster等，决定多个提供者的调用方式和容错逻辑
+     * @param registry  注册中心实例，用于消费者注册和提供者地址订阅
+     * @param type      服务接口类型，即消费者引用的服务接口Class对象
+     * @return 经过集群包装的ClusterInvoker对象，内部持有Directory和Cluster引用，调用时会自动进行地址选择和负载均衡
+     */
     protected <T> ClusterInvoker<T> doCreateInvoker(
             DynamicDirectory<T> directory, Cluster cluster, Registry registry, Class<T> type) {
         directory.setRegistry(registry);
         directory.setProtocol(protocol);
+        /*
+         * 提取消费者参数：
+         * 从ConsumerUrl中复制所有参数，用于构建注册到注册中心的URL
+         */
         // all attributes of REFER_KEY
         Map<String, String> parameters =
                 new HashMap<>(directory.getConsumerUrl().getParameters());
@@ -659,11 +880,23 @@ public class RegistryProtocol implements Protocol, ScopeModelAware {
                 parameters);
         urlToRegistry = urlToRegistry.setScopeModel(directory.getConsumerUrl().getScopeModel());
         urlToRegistry = urlToRegistry.setServiceModel(directory.getConsumerUrl().getServiceModel());
+        /*
+         * 消费者注册：
+         * 将consumer://URL写入注册中心，用于服务治理、监控统计和提供者感知
+         */
         if (directory.isShouldRegister()) {
             directory.setRegisteredConsumerUrl(urlToRegistry);
             registry.register(directory.getRegisteredConsumerUrl());
         }
+        /*
+         * 构建路由链：
+         * 加载所有激活的路由规则，用于后续请求的过滤和路由决策
+         */
         directory.buildRouterChain(urlToRegistry);
+        /*
+         * 订阅提供者地址：
+         * 监听注册中心的providers节点变化，动态更新Directory中的Invoker列表
+         */
         directory.subscribe(toSubscribeUrl(urlToRegistry));
 
         return (ClusterInvoker<T>) cluster.join(directory, true);

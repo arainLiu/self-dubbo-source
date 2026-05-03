@@ -209,20 +209,57 @@ public abstract class FailbackRegistry extends AbstractRegistry {
         return failedUnsubscribed;
     }
 
+    /**
+     * 注册服务提供者地址到注册中心，具备自动重试和失败容错能力。
+     * <p>
+     * 该方法是FailbackRegistry的核心实现，在AbstractRegistry的基础上增加了失败重试机制。
+     * 当注册失败时，根据check参数决定是否立即抛出异常还是异步重试。
+     * </p>
+     * <p>
+     * 处理流程：
+     * <ol>
+     *   <li><b>前置校验</b>：通过shouldRegister判断URL是否需要注册（如协议类型过滤、extra标记检查）</li>
+     *   <li><b>状态清理</b>：移除之前可能存在的失败注册和取消记录，避免脏数据干扰</li>
+     *   <li><b>执行注册</b>：调用doRegister模板方法将URL写入注册中心（由子类实现具体逻辑）</li>
+     *   <li><b>异常处理</b>：根据check参数和异常类型决定是抛出异常还是加入重试队列</li>
+     *   <li><b>失败重试</b>：对于非致命异常，将URL添加到failedRegistered列表，通过定时任务定期重试</li>
+     * </ol>
+     * </p>
+     *
+     * @param url 需要注册的服务提供者URL，包含服务接口、协议、主机、端口等完整信息
+     * @throws IllegalStateException 当满足以下条件之一时抛出：
+     *                               <ul>
+     *                                 <li>check参数为true且注册失败（启动时严格检查）</li>
+     *                                 <li>异常为SkipFailbackWrapperException类型（包装的致命异常）</li>
+     *                               </ul>
+     */
     @Override
     public void register(URL url) {
         if (!shouldRegister(url)) {
             return;
         }
         super.register(url);
+        /*
+         * 清理历史失败记录：
+         * 确保本次注册不受之前失败操作的影响，避免重复重试
+         */
         removeFailedRegistered(url);
         removeFailedUnregistered(url);
         try {
+            /*
+             * 执行实际注册操作：
+             * 调用子类的doRegister实现（如ZookeeperRegistry的节点创建），可能抛出异常
+             */
             // Sending a registration request to the server side
             doRegister(url);
         } catch (Exception e) {
             Throwable t = e;
 
+            /*
+             * 判断是否应该直接抛出异常：
+             * check=true表示启动阶段需要严格检查，端口为0表示本地服务无需严格检查
+             * SkipFailbackWrapperException表示不可恢复的致命异常，需要立即抛出
+             */
             // If the startup detection is opened, the Exception is thrown directly.
             boolean check = getUrl().getParameter(Constants.CHECK_KEY, true)
                     && url.getParameter(Constants.CHECK_KEY, true)
@@ -237,6 +274,10 @@ public abstract class FailbackRegistry extends AbstractRegistry {
                                 + t.getMessage(),
                         t);
             } else {
+                /*
+                 * 记录失败日志并安排重试：
+                 * 对于临时性故障（如网络抖动），通过定时任务定期重试，保证最终一致性
+                 */
                 logger.error(
                         INTERNAL_ERROR,
                         "unknown error in registry module",
@@ -245,6 +286,10 @@ public abstract class FailbackRegistry extends AbstractRegistry {
                         t);
             }
 
+            /*
+             * 加入失败重试队列：
+             * 创建FailedRegisteredTask并通过HashedWheelTimer定时重试（默认周期5秒）
+             */
             // Record a failed registration request to a failed list, retry regularly
             addFailedRegistered(url);
         }
@@ -342,11 +387,45 @@ public abstract class FailbackRegistry extends AbstractRegistry {
         }
     }
 
+    /**
+     * 订阅服务提供者地址和配置规则，具备失败重试和本地缓存降级能力。
+     * <p>
+     * 该方法是FailbackRegistry的核心实现，在AbstractRegistry的基础上增加了订阅失败的容错机制。
+     * 当订阅失败时，优先使用本地缓存的URL列表进行降级，如果缓存也不存在则根据check参数决定是否抛出异常或异步重试。
+     * </p>
+     * <p>
+     * 主要处理流程：
+     * <ol>
+     *   <li><b>父类订阅</b>：调用super.subscribe将URL和Listener注册到本地缓存，建立订阅关系的基础数据结构</li>
+     *   <li><b>清理失败记录</b>：移除之前可能存在的失败订阅记录，避免脏数据干扰本次订阅</li>
+     *   <li><b>执行订阅</b>：调用doSubscribe模板方法向注册中心发起订阅请求（由子类实现Zookeeper/Nacos等具体逻辑）</li>
+     *   <li><b>异常处理</b>：
+     *     <ul>
+     *       <li><b>有缓存降级</b>：从getCacheUrls获取本地缓存的提供者地址列表，立即通知Listener使用缓存数据，记录ERROR日志但不中断启动</li>
+     *       <li><b>无缓存且check=true</b>：当开启启动检查或异常为SkipFailbackWrapperException时，直接抛出IllegalStateException阻止应用启动</li>
+     *       <li><b>无缓存且check=false</b>：记录ERROR日志并调用addFailedSubscribed将订阅任务加入重试队列，通过定时任务定期重试（默认5秒间隔）</li>
+     *     </ul>
+     *   </li>
+     * </ol>
+     * </p>
+     *
+     * @param url      订阅URL，包含服务接口名、版本、分组、分类（providers/configurators/routers）等订阅条件
+     * @param listener 通知监听器，当注册中心推送地址变更或配置更新时触发回调，重新生成Invoker链
+     * @throws IllegalStateException 当订阅失败且check参数为true或异常为SkipFailbackWrapperException时抛出
+     */
     @Override
     public void subscribe(URL url, NotifyListener listener) {
         super.subscribe(url, listener);
+        /*
+         * 清理历史失败记录：
+         * 确保本次订阅不受之前失败操作的影响，避免重复重试
+         */
         removeFailedSubscribed(url, listener);
         try {
+            /*
+             * 执行实际订阅操作：
+             * 调用子类的doSubscribe实现（如ZookeeperRegistry的create持久化监听器），可能抛出异常
+             */
             // Sending a subscription request to the server side
             doSubscribe(url, listener);
         } catch (Exception e) {
@@ -354,6 +433,10 @@ public abstract class FailbackRegistry extends AbstractRegistry {
 
             List<URL> urls = getCacheUrls(url);
             if (CollectionUtils.isNotEmpty(urls)) {
+                /*
+                 * 缓存降级策略：
+                 * 当注册中心不可用时，使用本地磁盘缓存的地址列表继续运行，保证服务的可用性
+                 */
                 notify(url, listener, urls);
                 logger.error(
                         REGISTRY_FAILED_NOTIFY_EVENT,
@@ -363,6 +446,11 @@ public abstract class FailbackRegistry extends AbstractRegistry {
                                 + getCacheFile().getName() + ", cause: " + t.getMessage(),
                         t);
             } else {
+                /*
+                 * 判断是否应该直接抛出异常：
+                 * check=true表示启动阶段需要严格检查，必须确保订阅成功才能继续
+                 * SkipFailbackWrapperException表示不可恢复的致命异常，需要立即抛出
+                 */
                 // If the startup detection is opened, the Exception is thrown directly.
                 boolean check =
                         getUrl().getParameter(Constants.CHECK_KEY, true) && url.getParameter(Constants.CHECK_KEY, true);
@@ -373,6 +461,10 @@ public abstract class FailbackRegistry extends AbstractRegistry {
                     }
                     throw new IllegalStateException("Failed to subscribe " + url + ", cause: " + t.getMessage(), t);
                 } else {
+                    /*
+                     * 记录失败并安排重试：
+                     * 对于临时性故障（如网络抖动），通过定时任务定期重试，保证最终一致性
+                     */
                     logger.error(
                             REGISTRY_FAILED_NOTIFY_EVENT,
                             "",
@@ -382,6 +474,10 @@ public abstract class FailbackRegistry extends AbstractRegistry {
                 }
             }
 
+            /*
+             * 加入失败重试队列：
+             * 创建FailedSubscribedTask并通过HashedWheelTimer定时重试（默认周期5秒）
+             */
             // Record a failed registration request to a failed list, retry regularly
             addFailedSubscribed(url, listener);
         }

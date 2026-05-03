@@ -49,6 +49,26 @@ public class ProtocolFilterWrapper implements Protocol {
         return protocol.getDefaultPort();
     }
 
+    /**
+     * 导出服务提供者，为Invoker构建过滤器链以增强RPC调用功能。
+     * <p>
+     * 该方法是Dubbo服务导出流程中的关键装饰器，负责在真正的协议层导出之前，
+     * 根据配置动态组装过滤器链（如日志、监控、限流、认证等），将原始Invoker包装为具备横切关注点能力的增强Invoker。
+     * </p>
+     * <p>
+     * 主要处理流程：
+     * <ol>
+     *   <li><b>注册中心URL判断</b>：如果invoker的URL是registry://协议，说明是RegistryProtocol层面的导出，直接委托给底层protocol，不构建过滤器链</li>
+     *   <li><b>获取过滤器链构建器</b>：调用getFilterChainBuilder从SPI扩展中获取激活的FilterChainBuilder实现（默认为DefaultFilterChainBuilder）</li>
+     *   <li><b>构建过滤器链</b>：调用builder.buildInvokerChain传入SERVICE_FILTER_KEY和PROVIDER标识，加载所有激活的Provider端Filter，按order排序后依次包装Invoker</li>
+     *   <li><b>协议层导出</b>：将增强后的Invoker委托给底层protocol（如DubboProtocol）进行真正的网络暴露和端口绑定</li>
+     * </ol>
+     * </p>
+     *
+     * @param invoker 服务提供者的调用器对象，包含服务接口、实现类引用、URL配置等信息
+     * @return 经过过滤器链增强的Exporter对象，负责接收远程调用并依次执行过滤器逻辑
+     * @throws RpcException 当过滤器链构建失败、端口绑定异常或协议层导出出错时抛出RPC异常
+     */
     @Override
     public <T> Exporter<T> export(Invoker<T> invoker) throws RpcException {
         if (UrlUtils.isRegistry(invoker.getUrl())) {

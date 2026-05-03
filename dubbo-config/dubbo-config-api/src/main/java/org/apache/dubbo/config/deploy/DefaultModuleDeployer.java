@@ -159,12 +159,40 @@ public class DefaultModuleDeployer extends AbstractDeployer<ModuleModel> impleme
         return startSync();
     }
 
+    /**
+     * 同步启动模块部署器，完成服务导出、引用和注册的完整流程。
+     * <p>
+     * 该方法是Dubbo模块启动的核心入口，负责协调模块级别的服务发布和订阅操作。
+     * 支持同步和异步两种模式，通过CompletableFuture实现非阻塞等待。
+     * </p>
+     * <p>
+     * 主要处理流程：
+     * <ol>
+     *   <li><b>状态校验</b>：检查模块是否处于可启动状态，防止重复启动或在停止状态下启动</li>
+     *   <li><b>初始化</b>：加载配置、解析参数、创建必要的资源（线程池、注册中心连接等）</li>
+     *   <li><b>服务导出</b>：遍历所有ServiceConfig，将本地服务暴露为可远程调用的Exporter</li>
+     *   <li><b>服务引用</b>：遍历所有ReferenceConfig，创建远程服务的本地代理Invoker</li>
+     *   <li><b>内部模块准备</b>：触发应用级内部模块的初始化，确保框架组件可用</li>
+     *   <li><b>完成判断</b>：根据是否有异步任务决定是同步返回还是异步等待</li>
+     *   <li><b>服务注册</b>：将所有导出的服务注册地址写入注册中心（仅提供者）</li>
+     *   <li><b>引用检查</b>：验证消费者引用的服务是否可用，失败时抛出异常或记录警告</li>
+     *   <li><b>状态发布</b>：触发ModuleStarted/ModuleCompletion事件，通知监听器模块启动完成</li>
+     * </ol>
+     * </p>
+     *
+     * @return 模块启动的Future对象，调用方可通过它等待启动完成或获取异常信息
+     * @throws IllegalStateException 当模块处于停止、 stopping或failed状态时尝试再次启动会抛出此异常
+     */
     private synchronized Future startSync() throws IllegalStateException {
         if (isStopping() || isStopped() || isFailed()) {
             throw new IllegalStateException(getIdentifier() + " is stopping or stopped, can not start again");
         }
 
         try {
+            /*
+             * 幂等性保护：
+             * 如果模块已经在启动中、已启动或已完成，直接返回现有的Future避免重复执行
+             */
             if (isStarting() || isStarted() || isCompletion()) {
                 return startFuture;
             }
@@ -173,26 +201,51 @@ public class DefaultModuleDeployer extends AbstractDeployer<ModuleModel> impleme
 
             initialize();
 
+            /*
+             * 接口级服务注册
+             * 遍历模块内所有ServiceConfig，将Java对象暴露为RPC服务（绑定端口、生成Invoker等）
+             */
             // export services
             exportServices();
 
+            /*
+             * 准备应用级内部模块：
+             * 排除内部模块自身，避免自等待导致的死锁问题
+             */
             // prepare application instance
             // exclude internal module to avoid wait itself
             if (moduleModel != moduleModel.getApplicationModel().getInternalModule()) {
                 applicationDeployer.prepareInternalModule();
             }
 
+            /*
+             * 引用远程服务：
+             * 遍历模块内所有ReferenceConfig，创建远程服务的本地代理对象
+             */
             // refer services
             referServices();
 
+            /*
+             * 同步执行路径：
+             * 当没有异步导出/引用任务时，直接在当前线程完成后续操作
+             */
             // if no async export/refer services, just set started
             if (asyncExportingFutures.isEmpty() && asyncReferringFutures.isEmpty()) {
+                //应用级注册
                 // publish module started event
                 onModuleStarted();
 
+                /*
+                 * 注册服务到注册中心：
+                 * 将所有导出的服务地址写入注册中心（Zookeeper/Nacos等），供消费者发现
+                 */
                 // register services to registry
                 registerServices();
 
+                /*
+                 * 验证引用配置：
+                 * 检查消费者引用的服务是否可达，失败时根据check参数决定是否抛出异常
+                 */
                 // check reference config
                 checkReferences();
 
@@ -202,17 +255,33 @@ public class DefaultModuleDeployer extends AbstractDeployer<ModuleModel> impleme
                 // complete module start future after application state changed
                 completeStartFuture(true);
             } else {
+                /*
+                 * 异步执行路径：
+                 * 提交到共享线程池，后台等待所有导出/引用任务完成后继续执行
+                 */
                 frameworkExecutorRepository.getSharedExecutor().submit(() -> {
                     try {
+                        /*
+                         * 等待所有服务导出完成：
+                         * 阻塞直到所有ServiceConfig的异步export任务结束
+                         */
                         // wait for export finish
                         waitExportFinish();
 
+                        /*
+                         * 等待所有服务引用完成：
+                         * 阻塞直到所有ReferenceConfig的异步refer任务结束
+                         */
                         // wait for refer finish
                         waitReferFinish();
 
                         // publish module started event
                         onModuleStarted();
 
+                        /*
+                         * 注册服务到注册中心：
+                         * 在异步任务完成后统一执行批量注册
+                         */
                         // register services to registry
                         registerServices();
 
@@ -460,6 +529,27 @@ public class DefaultModuleDeployer extends AbstractDeployer<ModuleModel> impleme
         }
     }
 
+    /**
+     * 导出单个服务配置，支持同步和异步两种模式。
+     * <p>
+     * 该方法是模块部署器中服务导出的核心执行单元，负责将ServiceConfig转换为可远程调用的服务。
+     * 根据配置的异步标志决定是在当前线程立即执行，还是提交到专用线程池异步执行。
+     * </p>
+     * <p>
+     * 处理流程：
+     * <ol>
+     *   <li><b>配置刷新</b>：如果ServiceConfig未刷新，先调用refresh解析和合并配置参数</li>
+     *   <li><b>幂等性检查</b>：如果服务已导出则直接返回，避免重复导出</li>
+     *   <li><b>异步判断</b>：根据exportAsync全局配置或sc.shouldExportAsync()单独配置决定执行模式</li>
+     *   <li><b>异步执行</b>：提交到serviceExportExecutor线程池，通过CompletableFuture跟踪任务状态</li>
+     *   <li><b>同步执行</b>：直接在当前线程调用export，使用AUTO_REGISTER_BY_DEPLOYER注册类型（延迟到应用启动完成后注册）</li>
+     *   <li><b>异常处理</b>：异步模式下捕获异常并记录日志，不会中断其他服务的导出流程</li>
+     *   <li><b>状态标记</b>：如果服务配置了注册中心，设置registryInteracted标志用于后续判断是否需要元数据交互</li>
+     * </ol>
+     * </p>
+     *
+     * @param sc 服务配置基类对象，实际类型为ServiceConfig<?>，包含服务接口的所有导出配置
+     */
     private void exportServiceInternal(ServiceConfigBase sc) {
         ServiceConfig<?> serviceConfig = (ServiceConfig<?>) sc;
         if (!serviceConfig.isRefreshed()) {
@@ -468,6 +558,10 @@ public class DefaultModuleDeployer extends AbstractDeployer<ModuleModel> impleme
         if (sc.isExported()) {
             return;
         }
+        /*
+         * 异步导出路径：
+         * 当配置了全局异步导出或服务级别异步导出时，提交到专用线程池执行
+         */
         if (exportAsync || sc.shouldExportAsync()) {
             ExecutorService executor = executorRepository.getServiceExportExecutor();
             CompletableFuture<Void> future = CompletableFuture.runAsync(
@@ -491,12 +585,21 @@ public class DefaultModuleDeployer extends AbstractDeployer<ModuleModel> impleme
 
             asyncExportingFutures.add(future);
         } else {
+            /*
+             * 同步导出路径：
+             * 在当前线程立即执行导出，使用AUTO_REGISTER_BY_DEPLOYER模式延迟注册
+             * 这样可以在所有服务导出完成后再统一注册，避免部分服务提前暴露
+             */
             if (!sc.isExported()) {
                 sc.export(RegisterTypeEnum.AUTO_REGISTER_BY_DEPLOYER);
                 exportedServices.add(sc);
             }
         }
 
+        /*
+         * 标记注册中心交互状态：
+         * 如果服务配置了注册中心，后续可能需要执行元数据上报和服务注册操作
+         */
         if (serviceConfig.hasRegistrySpecified()) {
             registryInteracted = true;
         }
@@ -535,7 +638,27 @@ public class DefaultModuleDeployer extends AbstractDeployer<ModuleModel> impleme
         asyncExportingFutures.clear();
     }
 
+    /**
+     * 引用远程服务，为所有配置的ReferenceConfig创建本地代理对象。
+     * <p>
+     * 该方法是Dubbo服务消费者的核心启动逻辑，负责遍历模块内所有ReferenceConfig配置，
+     * 根据配置创建远程服务的本地Invoker代理，使得调用方可以像调用本地方法一样调用远程服务。
+     * 支持同步和异步两种引用模式，并通过ReferenceCache实现代理对象的缓存和复用。
+     * </p>
+     * <p>
+     * 处理流程：
+     * <ol>
+     *   <li><b>配置刷新</b>：如果ReferenceConfig未刷新，先调用refresh解析和合并配置参数</li>
+     *   <li><b>初始化判断</b>：通过shouldInit检查是否需要立即创建连接（lazy=true时延迟到首次调用）</li>
+     *   <li><b>异步判断</b>：根据referAsync全局配置或rc.shouldReferAsync()单独配置决定执行模式</li>
+     *   <li><b>异步引用</b>：提交到serviceReferExecutor线程池，通过CompletableFuture跟踪任务状态</li>
+     *   <li><b>同步引用</b>：直接在当前线程调用referenceCache.get创建Invoker代理并建立网络连接</li>
+     *   <li><b>异常处理</b>：捕获异常后记录日志、销毁已创建的缓存对象，然后重新抛出异常中断启动流程</li>
+     * </ol>
+     * </p>
+     */
     private void referServices() {
+        // 拿到所有@DubboReference标注的服务，然后转化为ReferenceConfig
         configManager.getReferences().forEach(rc -> {
             try {
                 ReferenceConfig<?> referenceConfig = (ReferenceConfig<?>) rc;
@@ -543,12 +666,24 @@ public class DefaultModuleDeployer extends AbstractDeployer<ModuleModel> impleme
                     referenceConfig.refresh();
                 }
 
+                /*
+                 * 懒加载判断：
+                 * 只有shouldInit返回true时才立即创建引用，否则延迟到首次RPC调用时再初始化
+                 */
                 if (rc.shouldInit()) {
+                    /*
+                     * 异步引用路径：
+                     * 提交到专用线程池后台执行，避免阻塞主线程导致启动缓慢
+                     */
                     if (referAsync || rc.shouldReferAsync()) {
                         ExecutorService executor = executorRepository.getServiceReferExecutor();
                         CompletableFuture<Void> future = CompletableFuture.runAsync(
                                 () -> {
                                     try {
+                                        /*
+                                         * 从缓存获取或创建引用：
+                                         * ReferenceCache会检查是否已有相同key的Invoker，有则直接返回，无则创建新的
+                                         */
                                         referenceCache.get(rc, false);
                                     } catch (Throwable t) {
                                         logger.error(
@@ -564,10 +699,18 @@ public class DefaultModuleDeployer extends AbstractDeployer<ModuleModel> impleme
 
                         asyncReferringFutures.add(future);
                     } else {
+                        /*
+                         * 同步引用路径：
+                         * 在当前线程立即创建Invoker代理，阻塞直到连接建立完成
+                         */
                         referenceCache.get(rc, false);
                     }
                 }
             } catch (Throwable t) {
+                /*
+                 * 引用失败处理：
+                 * 记录错误日志、清理缓存中的失败对象，然后抛出异常中断模块启动
+                 */
                 logger.error(
                         CONFIG_FAILED_REFERENCE_MODEL,
                         "",

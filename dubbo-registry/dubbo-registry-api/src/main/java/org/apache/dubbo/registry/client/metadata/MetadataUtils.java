@@ -131,6 +131,40 @@ public class MetadataUtils {
         }
     }
 
+    /**
+     * 引用远程元数据服务，创建用于拉取提供者MetadataInfo的RPC代理对象。
+     * <p>
+     * 该方法是Dubbo3应用级服务发现中元数据拉取的核心入口，负责从指定的ServiceInstance构建MetadataService的Invoker代理。
+     * 支持MetadataServiceV2（Triple协议原生存根）和传统MetadataService两种版本，优先使用V2以获得更好的性能。
+     * </p>
+     * <p>
+     * 主要处理流程：
+     * <ol>
+     *   <li><b>构建元数据URL</b>：调用buildMetadataUrl从ServiceInstance中提取元数据服务的访问地址（通常是tri://ip:port格式）</li>
+     *   <li><b>获取内部模块</b>：从applicationModel.getInternalModule()获取框架内部使用的ModuleModel，避免与业务模块混淆</li>
+     *   <li><b>版本检测</b>：
+     *     <ul>
+     *       <li>检查instance是否支持MetadataServiceV2（通过url attribute中的METADATA_SERVICE_VERSION_NAME判断）</li>
+     *       <li>检测当前环境是否支持V2（Native Image环境下强制降级到JDK动态代理+传统MetadataService）</li>
+     *     </ul>
+     *   </li>
+     *   <li><b>注册消费者模型</b>：
+     *     <ul>
+     *       <li>V2模式：注册MetadataServiceV2接口，设置proxy=native-stub使用Triple协议原生存根</li>
+     *       <li>传统模式：注册MetadataService接口，使用默认的Javassist代理</li>
+     *     </ul>
+     *   </li>
+     *   <li><b>安全认证配置</b>：如果URL中设置了auth=true，添加consumersign过滤器用于请求签名验证</li>
+     *   <li><b>创建Invoker</b>：调用protocol.refer建立与提供者元数据端点的连接，生成可远程调用的Invoker对象</li>
+     *   <li><b>构建过滤器链</b>：如果启用认证，通过FilterChainBuilder构建包含签名验证的拦截器链</li>
+     *   <li><b>生成代理</b>：调用proxyFactory.getProxy将Invoker包装为本地代理对象，实现透明的RPC调用</li>
+     *   <li><b>完善ConsumerModel</b>：将代理对象设置到consumerModel的ServiceMetadata中，便于后续监控和生命周期管理</li>
+     * </ol>
+     * </p>
+     *
+     * @param instance 服务实例对象，包含应用名、主机地址、端口、元数据服务等注册时上报的完整信息
+     * @return RemoteMetadataService封装对象，内部持有MetadataService或MetadataServiceV2的RPC代理，可通过getInternalProxy()获取
+     */
     public static RemoteMetadataService referMetadataService(ServiceInstance instance) {
         URL url = buildMetadataUrl(instance);
 
@@ -147,7 +181,10 @@ public class MetadataUtils {
         boolean inNativeImage = NativeDetector.inNativeImage();
 
         if (useV2 && !inNativeImage) {
-            // If provider supports, we use MetadataServiceV2 in priority
+            /*
+             * 优先使用MetadataServiceV2：
+             * 基于Triple协议的原生存根，性能更好且支持流式传输
+             */
             url = url.addParameter(PROXY_KEY, NATIVE_STUB);
             url = url.setPath(MetadataServiceV2.class.getName());
             url = url.addParameter(VERSION_KEY, V2);
@@ -159,10 +196,18 @@ public class MetadataUtils {
                             url,
                             StubSuppliers.getServiceDescriptor(MetadataServiceV2.class.getName()));
         } else {
+            /*
+             * 降级到传统MetadataService：
+             * 使用Javassist动态代理，兼容老版本提供者
+             */
             consumerModel = applicationModel.getInternalModule().registerInternalConsumer(MetadataService.class, url);
         }
 
         if (inNativeImage) {
+            /*
+             * Native Image环境特殊处理：
+             * GraalVM不支持字节码生成，强制使用JDK动态代理
+             */
             url = url.addParameter(PROXY_KEY, "jdk");
         }
 
@@ -170,6 +215,10 @@ public class MetadataUtils {
 
         url = url.setServiceModel(consumerModel);
         if (url.getParameter(AUTH_KEY, false)) {
+            /*
+             * 启用安全认证：
+             * 添加consumersign过滤器，在RPC调用时附加签名参数
+             */
             url = url.addParameter(FILTER_KEY, "-default,consumersign");
         }
 
@@ -239,6 +288,33 @@ public class MetadataUtils {
         return url;
     }
 
+    /**
+     * 从远程获取指定Revision的应用级元数据信息，支持远程存储和实例直连两种模式。
+     * <p>
+     * 该方法是Dubbo3应用级服务发现中元数据拉取的核心工具方法，负责根据元数据存储类型选择合适的获取策略。
+     * 当元数据存储在远程中心（如Zookeeper/Nacos）时直接查询；当元数据存储在提供者实例本地时，通过RPC调用MetadataService获取。
+     * </p>
+     * <p>
+     * 主要处理流程：
+     * <ol>
+     *   <li><b>选择实例</b>：调用selectInstance从instances列表中选择一个可用的ServiceInstance（通常采用负载均衡策略）</li>
+     *   <li><b>获取存储类型</b>：调用getMetadataStorageType读取实例的metadata-type参数，判断是remote还是local模式</li>
+     *   <li><b>分支处理</b>：
+     *     <ul>
+     *       <li><b>远程存储模式（REMOTE_METADATA_STORAGE_TYPE）</b>：调用getMetadata直接从metadataReport查询元数据中心，避免增加提供者负担</li>
+     *       <li><b>本地存储模式（默认）</b>：调用referMetadataService创建临时的RemoteMetadataService代理，通过RPC调用提供者的MetadataService接口获取元数据，使用后立即销毁避免资源泄漏</li>
+     *     </ul>
+     *   </li>
+     *   <li><b>异常容错</b>：捕获所有Exception，记录ERROR日志后返回null，避免因单个实例元数据获取失败影响整体订阅流程</li>
+     *   <li><b>空值保护</b>：如果metadataInfo为null（网络异常、实例宕机等），返回MetadataInfo.EMPTY占位对象，避免调用方出现NullPointerException</li>
+     * </ol>
+     * </p>
+     *
+     * @param revision       元数据的版本号，用于标识特定时刻的应用配置快照，格式通常为MD5哈希值
+     * @param instances      服务实例列表，包含多个相同应用的实例地址，方法会从中选择一个进行通信
+     * @param metadataReport 元数据报告实例，用于远程存储模式下查询元数据中心，可能为null（纯本地存储场景）
+     * @return 应用级元数据信息对象，包含所有服务接口的定义、方法列表、配置参数等，如果获取失败则返回EMPTY常量
+     */
     public static MetadataInfo getRemoteMetadata(
             String revision, List<ServiceInstance> instances, MetadataReport metadataReport) {
         ServiceInstance instance = selectInstance(instances);
@@ -249,8 +325,16 @@ public class MetadataUtils {
                 logger.debug("Instance " + instance.getAddress() + " is using metadata type " + metadataType);
             }
             if (REMOTE_METADATA_STORAGE_TYPE.equals(metadataType)) {
+                /*
+                 * 远程存储模式：
+                 * 直接从元数据中心（Zookeeper/Nacos）查询，减轻提供者实例负载
+                 */
                 metadataInfo = MetadataUtils.getMetadata(revision, instance, metadataReport);
             } else {
+                /*
+                 * 本地存储模式：
+                 * 通过RPC调用提供者实例的MetadataService接口获取元数据，使用临时代理后立即销毁
+                 */
                 // change the instance used to communicate to avoid all requests route to the same instance
                 RemoteMetadataService remoteMetadataService = null;
                 try {
@@ -277,6 +361,9 @@ public class MetadataUtils {
         }
         return metadataInfo;
     }
+
+    // ... existing code ...
+
 
     public static void destroyProxy(RemoteMetadataService remoteMetadataService) {
         if (remoteMetadataService != null) {

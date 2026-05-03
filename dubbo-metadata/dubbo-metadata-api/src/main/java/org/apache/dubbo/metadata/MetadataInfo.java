@@ -143,21 +143,58 @@ public class MetadataInfo implements Serializable {
         }
     }
 
+    /**
+     * 添加服务URL到元数据信息中，同时收集服务级别和实例级别的参数。
+     * <p>
+     * 该方法是Dubbo3应用级服务发现的核心实现，负责将服务配置提取并存储到MetadataInfo中，
+     * 用于后续向元数据中心上报和注册中心的服务发现。支持通过SPI机制扩展参数过滤规则。
+     * </p>
+     * <p>
+     * 处理流程：
+     * <ol>
+     *   <li><b>过滤器加载</b>：通过ExtensionLoader获取MetadataParamsFilter的激活实现，确定需要收集的参数</li>
+     *   <li><b>服务级元数据生成</b>：创建ServiceInfo对象，包含接口、版本、分组、协议等完整标识信息</li>
+     *   <li><b>实例级参数提取</b>：从URL中提取通用的实例级别参数（如应用名、主机地址等），用于注册中心注册</li>
+     *   <li><b>导出URL缓存</b>：将URL按服务键组织存放到exportedServiceURLs中，便于后续查询和管理</li>
+     *   <li><b>更新标记</b>：设置updated标志为true，表示元数据已变更，下次调用calAndGetRevision时会重新计算revision</li>
+     * </ol>
+     * </p>
+     *
+     * @param url 服务提供者的URL地址，包含服务接口的所有配置参数（协议、主机、端口、方法列表等）
+     */
     public synchronized void addService(URL url) {
+        /*
+         * 延迟初始化ExtensionLoader：
+         * 在首次添加服务时获取MetadataParamsFilter的扩展加载器，避免不必要的初始化开销
+         */
         // fixme, pass in application mode context during initialization of MetadataInfo.
         if (this.loader == null) {
             this.loader = url.getOrDefaultApplicationModel().getExtensionLoader(MetadataParamsFilter.class);
         }
         List<MetadataParamsFilter> filters = loader.getActivateExtension(url, "params-filter");
+        /*
+         * 生成服务级元数据：
+         * ServiceInfo包含服务的完整描述信息（接口名、版本、分组、协议、方法、参数等）
+         * 使用matchKey作为唯一标识，格式为：{group}/{interface}:{version}:{protocol}
+         */
         // generate service level metadata
         ServiceInfo serviceInfo = new ServiceInfo(url, filters);
         this.services.put(serviceInfo.getMatchKey(), serviceInfo);
+        /*
+         * 提取实例级通用参数：
+         * 从URL中筛选出需要在实例级别上报的参数（如应用名、环境信息等）
+         * 这些参数会被合并到instanceParams中，用于注册中心的元数据展示
+         */
         // extract common instance level params
         extractInstanceParams(url, filters);
 
         if (exportedServiceURLs == null) {
             exportedServiceURLs = new ConcurrentSkipListMap<>();
         }
+        /*
+         * 缓存导出的服务URL：
+         * 按服务键（{group}/{interface}:{version}）组织，支持快速检索和遍历
+         */
         addURL(exportedServiceURLs, url);
         updated = true;
     }

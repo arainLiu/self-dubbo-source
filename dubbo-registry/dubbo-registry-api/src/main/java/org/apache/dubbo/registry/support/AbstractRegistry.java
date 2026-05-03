@@ -586,12 +586,42 @@ public abstract class AbstractRegistry implements Registry {
         }
     }
 
+    /**
+     * 保存订阅地址到本地缓存文件，提供注册中心不可用时的降级能力。
+     * <p>
+     * 该方法负责将当前订阅到的所有提供者地址序列化并写入磁盘文件（默认路径：~/.dubbo/dubbo-registry-{app}.cache），
+     * 使得应用在注册中心宕机或网络故障时仍能使用上次缓存的地址继续运行。支持同步和异步两种保存策略。
+     * </p>
+     * <p>
+     * 主要处理流程：
+     * <ol>
+     *   <li><b>文件检查</b>：如果未配置本地缓存文件路径（file=null），直接返回不执行保存</li>
+     *   <li><b>数据组装</b>：从notified Map中提取当前URL对应的所有分类（providers/configurators/routers）的地址列表</li>
+     *   <li><b>序列化处理</b>：遍历所有分类的URL，使用URL_SEPARATOR（空格）分隔拼接成字符串，格式：url1 url2 url3</li>
+     *   <li><b>更新属性</b>：将拼接好的地址字符串存入properties对象，key为serviceKey（格式：interface:version@group）</li>
+     *   <li><b>版本号递增</b>：调用lastCacheChanged.incrementAndGet生成新的版本号，用于CAS乐观锁防止并发写冲突</li>
+     *   <li><b>执行保存</b>：
+     *     <ul>
+     *       <li>同步模式（syncSaveFile=true）：立即调用doSaveProperties在当前线程写入磁盘，保证数据一致性但可能阻塞通知流程</li>
+     *       <li>异步模式（syncSaveFile=false）：通过registryCacheExecutor延迟调度（默认1秒后），避免阻塞主线程，提升性能</li>
+     *     </ul>
+     *   </li>
+     *   <li><b>异常容错</b>：捕获所有Throwable但不抛出，仅记录WARN日志，确保缓存失败不影响订阅流程</li>
+     * </ol>
+     * </p>
+     *
+     * @param url 订阅的服务URL，包含接口名、版本、分组等信息，作为缓存文件的key标识
+     */
     private void saveProperties(URL url) {
         if (file == null) {
             return;
         }
 
         try {
+            /*
+             * 构建地址字符串：
+             * 将所有分类的URL拼接成一个字符串，使用空格分隔
+             */
             StringBuilder buf = new StringBuilder();
             Map<String, List<URL>> categoryNotified = notified.get(url);
             if (categoryNotified != null) {
@@ -605,7 +635,15 @@ public abstract class AbstractRegistry implements Registry {
                 }
             }
             properties.setProperty(url.getServiceKey(), buf.toString());
+            /*
+             * 版本号递增：
+             * 用于CAS机制防止并发写入时的数据覆盖问题
+             */
             long version = lastCacheChanged.incrementAndGet();
+            /*
+             * 执行文件保存：
+             * 根据syncSaveFile配置决定是同步立即写入还是异步延迟写入
+             */
             if (syncSaveFile) {
                 doSaveProperties(version);
             } else {

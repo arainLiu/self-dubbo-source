@@ -225,6 +225,28 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
         this.services = services;
     }
 
+    /**
+     * 获取远程服务的本地代理对象，延迟初始化Invoker并建立网络连接。
+     * <p>
+     * 该方法是Dubbo服务消费者的核心入口，负责在首次调用时触发ReferenceConfig的初始化流程，
+     * 创建远程服务的Invoker代理对象，使得调用方可以像调用本地方法一样进行RPC调用。
+     * 支持幂等性保证，多次调用返回同一个代理实例（单例模式）。
+     * </p>
+     * <p>
+     * 处理流程：
+     * <ol>
+     *   <li><b>状态校验</b>：检查ReferenceConfig是否已被销毁，已销毁则抛出异常避免使用无效对象</li>
+     *   <li><b>懒加载判断</b>：如果ref已存在直接返回，实现延迟初始化和单例缓存</li>
+     *   <li><b>模块启动</b>：根据生命周期管理模式决定是prepare（外部管理）还是start（内部管理）模块部署器</li>
+     *   <li><b>初始化执行</b>：调用init(check)方法完成注册中心连接、提供者发现、Invoker创建和代理生成</li>
+     *   <li><b>返回代理</b>：返回生成的本地代理对象ref，类型为服务接口</li>
+     * </ol>
+     * </p>
+     *
+     * @param check 是否进行严格检查，true时在连接失败或提供者不可用时抛出异常，false时仅记录警告日志
+     * @return 远程服务的本地代理对象，类型为服务接口T
+     * @throws IllegalStateException 当ReferenceConfig已被销毁时尝试获取代理会抛出此异常
+     */
     @Override
     @Transient
     public T get(boolean check) {
@@ -232,11 +254,23 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
             throw new IllegalStateException("The invoker of ReferenceConfig(" + url + ") has already destroyed!");
         }
 
+        /*
+         * 延迟初始化：
+         * 仅在首次调用get时触发init流程，后续调用直接返回缓存的代理对象
+         */
         if (ref == null) {
             if (getScopeModel().isLifeCycleManagedExternally()) {
+                /*
+                 * 外部生命周期管理模式：
+                 * 当模块的生命周期由外部框架（如Spring）管理时，仅执行prepare准备必要资源
+                 */
                 // prepare model for reference
                 getScopeModel().getDeployer().prepare();
             } else {
+                /*
+                 * 内部生命周期管理模式：
+                 * 当模块由Dubbo框架自己管理时，启动完整的模块部署流程
+                 */
                 // ensure start module, compatible with old api usage
                 getScopeModel().getDeployer().start();
             }
@@ -329,6 +363,33 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
         init(true);
     }
 
+    /**
+     * 初始化ReferenceConfig，创建远程服务的Invoker代理并建立网络连接。
+     * <p>
+     * 该方法是Dubbo服务消费者初始化的核心逻辑，负责完成从配置解析到代理生成的完整流程。
+     * 包括配置刷新、元数据初始化、ConsumerModel创建、Invoker组装和可用性检查等步骤。
+     * 通过ReentrantLock保证线程安全，支持并发调用场景下的幂等性。
+     * </p>
+     * <p>
+     * 主要处理流程：
+     * <ol>
+     *   <li><b>幂等性检查</b>：如果已初始化且ref不为空则直接返回，避免重复初始化</li>
+     *   <li><b>配置刷新</b>：调用refresh解析注解、XML配置和系统属性，合并到当前对象</li>
+     *   <li><b>代理类型检测</b>：对于DubboStub接口自动切换到NATIVE_STUB（Triple协议）模式</li>
+     *   <li><b>元数据初始化</b>：设置serviceMetadata的服务类型和服务键（格式：group/interface:version）</li>
+     *   <li><b>参数组装</b>：通过appendConfig收集ApplicationConfig、ConsumerConfig、ReferenceConfig等所有配置参数</li>
+     *   <li><b>服务描述符注册</b>：将接口信息注册到ModuleServiceRepository，区分Native Stub和普通代理两种模式</li>
+     *   <li><b>ConsumerModel创建</b>：构建消费者模型，包含服务键、代理工厂、异步方法配置、类加载器等上下文信息</li>
+     *   <li><b>代理创建</b>：调用createProxy完成注册中心查询、Invoker路由链构建和本地代理生成</li>
+     *   <li><b>元数据完善</b>：将生成的代理对象设置到serviceMetadata和consumerModel中</li>
+     *   <li><b>可用性检查</b>：当check=true时，验证提供者是否可用，失败则抛出异常</li>
+     *   <li><b>异常清理</b>：发生异常时调用logAndCleanup销毁已创建的资源，避免内存泄漏</li>
+     * </ol>
+     * </p>
+     *
+     * @param check 是否进行严格检查，true时在无可用提供者或连接失败时抛出异常，false时仅记录警告日志继续执行
+     * @throws IllegalStateException 当配置错误、注册中心连接失败或无可用提供者时可能抛出
+     */
     protected void init(boolean check) {
         lock.lock();
         try {
@@ -339,6 +400,10 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
                 if (!this.isRefreshed()) {
                     this.refresh();
                 }
+                /*
+                 * 自动检测代理类型：
+                 * 对于实现DubboStub接口的服务，自动使用NATIVE_STUB（Triple协议原生存根）模式
+                 */
                 // auto detect proxy type
                 String proxyType = getProxy();
                 if (StringUtils.isBlank(proxyType) && DubboStub.class.isAssignableFrom(interfaceClass)) {
@@ -357,12 +422,24 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
                 ModuleServiceRepository repository = getScopeModel().getServiceRepository();
                 ServiceDescriptor serviceDescriptor;
                 if (CommonConstants.NATIVE_STUB.equals(getProxy())) {
+                    /*
+                     * Native Stub模式：
+                     * 使用Triple协议的原生存根，需要从StubSuppliers获取服务描述符
+                     */
                     serviceDescriptor = StubSuppliers.getServiceDescriptor(interfaceName);
                     repository.registerService(serviceDescriptor);
                     setInterface(serviceDescriptor.getInterfaceName());
                 } else {
+                    /*
+                     * 普通代理模式：
+                     * 使用JDK动态代理或Javassist，直接注册接口类的服务描述符
+                     */
                     serviceDescriptor = repository.registerService(interfaceClass);
                 }
+                /*
+                 * 创建消费者模型：
+                 * ConsumerModel封装了消费者的所有运行时信息，包括异步方法配置、类加载器、服务元数据等
+                 */
                 consumerModel = new ConsumerModel(
                         serviceMetadata.getServiceKey(),
                         proxy,
@@ -380,6 +457,10 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
 
                 serviceMetadata.getAttachments().putAll(referenceParameters);
 
+                /*
+                 * 创建代理对象：
+                 * 根据referenceParameters构建Invoker链，生成最终的本地代理ref
+                 */
                 ref = createProxy(referenceParameters);
 
                 serviceMetadata.setTarget(ref);
@@ -389,6 +470,10 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
                 consumerModel.setProxyObject(ref);
                 consumerModel.initMethodModels();
 
+                /*
+                 * 可用性检查：
+                 * 当check=true时，验证是否有可用的提供者，失败则抛出异常阻止启动
+                 */
                 if (check) {
                     checkInvokerAvailable(0);
                 }
@@ -486,12 +571,43 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
         return map;
     }
 
+    /**
+     * 创建远程服务的本地代理对象，完成URL解析、Invoker组装和代理生成。
+     * <p>
+     * 该方法是Dubbo服务消费者代理创建的核心逻辑，负责将配置参数转换为可调用的Invoker链，
+     * 最终通过ProxyFactory生成本地代理对象。支持直连模式、注册中心模式和Mesh模式等多种部署场景。
+     * </p>
+     * <p>
+     * 主要处理流程：
+     * <ol>
+     *   <li><b>URL收集</b>：清空urls列表，根据meshMode配置决定是否启用服务网格模式</li>
+     *   <li><b>URL解析</b>：如果配置了url属性（直连地址或注册中心地址），调用parseUrl解析多个分号分隔的URL</li>
+     *   <li><b>注册中心查询</b>：如果未配置url，从注册中心拉取提供者地址列表，可能包含多个注册中心的URL</li>
+     *   <li><b>Invoker创建</b>：调用createInvoker根据urls构建Invoker链（包括Cluster、Router、Filter等组件）</li>
+     *   <li><b>日志记录</b>：记录服务引用成功的信息，标注是否为GenericService泛化调用</li>
+     *   <li><b>消费者URL构建</b>：创建consumer://协议的URL，携带所有消费端配置参数用于元数据上报</li>
+     *   <li><b>元数据发布</b>：通过MetadataUtils将消费者定义发布到元数据中心，供服务治理使用</li>
+     *   <li><b>代理生成</b>：调用proxyFactory.getProxy根据invoker生成本地代理对象（JDK动态代理或Javassist）</li>
+     * </ol>
+     * </p>
+     *
+     * @param referenceParameters 引用配置参数Map，包含接口名、版本、分组、超时时间、重试次数等所有RPC调用所需的配置
+     * @return 远程服务的本地代理对象，类型为服务接口T
+     */
     @SuppressWarnings({"unchecked"})
     private T createProxy(Map<String, String> referenceParameters) {
         urls.clear();
 
+        /*
+         * Mesh模式处理：
+         * 如果启用了服务网格模式，根据K8S环境变量和providedBy配置生成网格地址
+         */
         meshModeHandleUrl(referenceParameters);
 
+        /*
+         * URL收集策略：
+         * 优先使用用户配置的直连URL，否则从注册中心查询提供者地址
+         */
         if (StringUtils.isNotEmpty(url)) {
             // user specified URL, could be peer-to-peer address, or register center's address.
             parseUrl(referenceParameters);
@@ -499,6 +615,10 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
             // if protocols not in jvm checkRegistry
             aggregateUrlFromRegistry(referenceParameters);
         }
+        /*
+         * 创建Invoker链：
+         * 根据urls列表构建Cluster Invoker，包含负载均衡、路由规则、容错策略等
+         */
         createInvoker();
 
         if (logger.isInfoEnabled()) {
@@ -508,6 +628,10 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
                             : " it's not GenericService reference"));
         }
 
+        /*
+         * 构建消费者URL并上报元数据：
+         * consumer://协议URL用于标识消费端身份，携带IP、接口名、配置参数等信息
+         */
         URL consumerUrl = new ServiceConfigURL(
                 CONSUMER_PROTOCOL,
                 referenceParameters.get(REGISTER_IP_KEY),
@@ -518,6 +642,10 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
         consumerUrl = consumerUrl.setServiceModel(consumerModel);
         MetadataUtils.publishServiceDefinition(consumerUrl, consumerModel.getServiceModel(), getApplicationModel());
 
+        /*
+         * 生成最终代理对象：
+         * 通过ProxyFactory将Invoker包装为服务接口的代理，支持泛化调用和普通调用两种模式
+         */
         // create service proxy
         return (T) proxyFactory.getProxy(invoker, ProtocolUtils.isGeneric(generic));
     }
@@ -663,14 +791,51 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
     }
 
     /**
-     * \create a reference invoker
+     * 创建引用服务的Invoker对象，根据URL数量和类型选择合适的集群策略。
+     * <p>
+     * 该方法是Dubbo服务消费者Invoker组装的核心逻辑，负责将底层的Protocol层Invoker包装为具备集群容错能力的Cluster Invoker。
+     * 支持单注册中心、多注册中心、直连提供者等多种部署场景，并根据场景自动选择对应的Cluster实现（如Failover、ZoneAware等）。
+     * </p>
+     * <p>
+     * 主要处理流程：
+     * <ol>
+     *   <li><b>单URL场景</b>：
+     *     <ul>
+     *       <li>调用protocolSPI.refer创建基础Invoker（可能是RegistryProtocol、DubboProtocol等）</li>
+     *       <li>如果不是注册中心URL且未卸载集群功能，使用DEFAULT Cluster（默认为Failover）包装为StaticDirectory</li>
+     *       <li>Mesh模式下可能跳过Cluster包装，直接返回单个Invoker</li>
+     *     </ul>
+     *   </li>
+     *   <li><b>多URL场景</b>：
+     *     <ul>
+     *       <li>遍历所有URL，为每个URL创建对应的refer Invoker，不检查可用性（允许后期恢复）</li>
+     *       <li>如果包含注册中心URL，使用最后一个registryUrl作为目录URL，采用ZoneAwareCluster支持多区域容错</li>
+     *       <li>如果不包含注册中心URL（纯直连场景），使用第一个URL的cluster配置进行包装</li>
+     *     </ul>
+     *   </li>
+     *   <li><b>Invoker包装层次</b>：
+     *     <ul>
+     *       <li>注册中心模式：ZoneAwareClusterInvoker(StaticDirectory) -> FailoverClusterInvoker(RegistryDirectory) -> Invoker</li>
+     *       <li>直连模式：FailoverClusterInvoker(StaticDirectory) -> Invoker</li>
+     *     </ul>
+     *   </li>
+     * </ol>
+     * </p>
      */
     @SuppressWarnings({"unchecked", "rawtypes"})
     private void createInvoker() {
         if (urls.size() == 1) {
             URL curUrl = urls.get(0);
+            /*
+             * 单URL场景：
+             * 直接通过Protocol SPI创建Invoker，可能是RegistryProtocol（注册中心）或DubboProtocol（直连）
+             */
             invoker = protocolSPI.refer(interfaceClass, curUrl);
-            // registry url, mesh-enable and unloadClusterRelated is true, not need Cluster.
+            /*
+             * 集群包装判断：
+             * 非注册中心URL且未启用集群卸载时，使用默认Cluster（Failover）包装
+             * Mesh模式下可能设置unloadClusterRelated=true，跳过集群包装以提升性能
+             */
             if (!UrlUtils.isRegistry(curUrl) && !curUrl.getParameter(UNLOAD_CLUSTER_RELATED, false)) {
                 List<Invoker<?>> invokers = new ArrayList<>();
                 invokers.add(invoker);
@@ -678,9 +843,17 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
                         .join(new StaticDirectory(curUrl, invokers), true);
             }
         } else {
+            /*
+             * 多URL场景：
+             * 适用于多注册中心或多直连地址的复杂部署架构
+             */
             List<Invoker<?>> invokers = new ArrayList<>();
             URL registryUrl = null;
             for (URL url : urls) {
+                /*
+                 * 为每个URL创建Invoker：
+                 * 不检查当前是否可用，因为后续可能通过重连恢复
+                 */
                 // For multi-registry scenarios, it is not checked whether each referInvoker is available.
                 // Because this invoker may become available later.
                 invokers.add(protocolSPI.refer(interfaceClass, url));
@@ -692,6 +865,11 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
             }
 
             if (registryUrl != null) {
+                /*
+                 * 多注册中心场景：
+                 * 使用ZoneAwareCluster实现跨区域的智能路由和故障转移
+                 * 包装层次：ZoneAwareClusterInvoker -> StaticDirectory(多个RegistryDirectory) -> Invoker
+                 */
                 // registry url is available
                 // for multi-subscription scenario, use 'zone-aware' policy by default
                 String cluster = registryUrl.getParameter(CLUSTER_KEY, ZoneAwareCluster.NAME);
@@ -701,6 +879,10 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
                 invoker = Cluster.getCluster(registryUrl.getScopeModel(), cluster, false)
                         .join(new StaticDirectory(registryUrl, invokers), false);
             } else {
+                /*
+                 * 多直连地址场景：
+                 * 不使用注册中心，直接连接多个提供者实例，使用配置的Cluster策略进行负载均衡
+                 */
                 // not a registry url, must be direct invoke.
                 if (CollectionUtils.isEmpty(invokers)) {
                     throw new IllegalArgumentException("invokers == null");
@@ -712,6 +894,7 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
             }
         }
     }
+
 
     private void checkInvokerAvailable(long timeout) throws IllegalStateException {
         if (!shouldCheck()) {

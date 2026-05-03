@@ -345,10 +345,40 @@ public class ReferenceBean<T>
     }
 
     /**
-     * Create lazy proxy for reference.
+     * 创建懒加载代理对象，延迟初始化RPC调用器直到首次方法调用。
+     * <p>
+     * 该方法是Dubbo Spring集成中懒加载机制的核心实现，通过动态代理技术创建一个轻量级占位符对象。
+     * 在Spring容器启动阶段不建立网络连接，仅在业务代码首次调用代理方法时才触发init()流程，显著加快应用启动速度。
+     * </p>
+     * <p>
+     * 主要处理流程：
+     * <ol>
+     *   <li><b>收集代理接口</b>：
+     *     <ul>
+     *       <li>必须包含interfaceClass（服务接口），确保代理对象可以赋值给目标字段类型</li>
+     *       <li>添加内部接口（如EchoService、Destroyable等），支持Dubbo框架的内置功能</li>
+     *       <li>如果interfaceName与interfaceClass不同名（IDL场景或跨语言调用），尝试加载并添加实际的服务接口Class</li>
+     *     </ul>
+     *   </li>
+     *   <li><b>Native Image特殊处理</b>：检测是否运行在GraalVM Native Image环境，如果是则强制使用JDK动态代理（因为字节码生成受限）</li>
+     *   <li><b>Javassist优先策略</b>：如果lazyProxy为空且未指定proxy属性或使用默认值，优先尝试Javassist生成代理（性能优于JDK动态代理）</li>
+     *   <li><b>JDK动态代理降级</b>：如果Javassist生成失败或不满足条件，回退到JDK原生动态代理作为兜底方案</li>
+     * </ol>
+     * </p>
+     * <p>
+     * 代理生成策略选择：
+     * <ul>
+     *   <li><b>Javassist</b>：通过字节码生成技术创建代理类，方法调用直接转发，性能接近硬编码，但需要额外的内存存储生成的Class</li>
+     *   <li><b>JDK动态代理</b>：基于Java反射机制，无需生成额外Class文件，在Native Image环境下是唯一选择，但每次调用有轻微性能损耗</li>
+     * </ul>
+     * </p>
      */
     private void createLazyProxy() {
 
+        /*
+         * 收集需要代理的接口列表：
+         * 包括服务接口、Dubbo内部接口（EchoService等），确保代理对象具备完整的功能
+         */
         // set proxy interfaces
         // see also: org.apache.dubbo.rpc.proxy.AbstractProxyFactory.getProxy(org.apache.dubbo.rpc.Invoker<T>, boolean)
         List<Class<?>> interfaces = new ArrayList<>();
@@ -356,6 +386,10 @@ public class ReferenceBean<T>
         Class<?>[] internalInterfaces = AbstractProxyFactory.getInternalInterfaces();
         Collections.addAll(interfaces, internalInterfaces);
         if (!StringUtils.isEquals(interfaceClass.getName(), interfaceName)) {
+            /*
+             * 添加实际的服务接口：
+             * 处理IDL场景下interfaceName与interfaceClass不一致的情况
+             */
             // add service interface
             try {
                 Class<?> serviceInterface = ClassUtils.forName(interfaceName, beanClassLoader);
@@ -366,24 +400,74 @@ public class ReferenceBean<T>
         }
 
         if (NativeDetector.inNativeImage()) {
+            /*
+             * Native Image环境：
+             * GraalVM不支持运行时字节码生成，强制使用JDK动态代理
+             */
             generateFromJdk(interfaces);
         }
 
         if (this.lazyProxy == null
                 && (StringUtils.isEmpty(this.proxy) || CommonConstants.DEFAULT_PROXY.equalsIgnoreCase(this.proxy))) {
+            /*
+             * 优先使用Javassist：
+             * Javassist生成的代理性能更好，适合常规JVM环境
+             */
             generateFromJavassistFirst(interfaces);
         }
 
         if (this.lazyProxy == null) {
+            /*
+             * JDK动态代理降级：
+             * 当Javassist不可用或生成失败时，使用JDK原生代理作为兜底
+             */
             generateFromJdk(interfaces);
         }
     }
 
+    /**
+     * 优先使用Javassist生成动态代理，失败时自动降级到JDK动态代理。
+     * <p>
+     * 该方法是Dubbo懒加载代理的核心生成逻辑，采用"Javassist优先+JDK降级"的双重保障策略。
+     * Javassist生成的代理通过字节码直接调用，性能优于JDK反射代理；但在某些特殊环境（如模块化系统、安全限制）下可能失败，
+     * 此时自动回退到JDK动态代理确保功能可用性。
+     * </p>
+     * <p>
+     * 主要处理流程：
+     * <ol>
+     *   <li><b>Javassist代理生成</b>：
+     *     <ul>
+     *       <li>调用Proxy.getProxy传入所有接口数组，生成动态代理类</li>
+     *       <li>通过newInstance创建代理实例，传入LazyTargetInvocationHandler作为方法调用处理器</li>
+     *       <li>DubboReferenceLazyInitTargetSource封装了延迟初始化逻辑，首次调用时才触发ReferenceBean.init()建立RPC连接</li>
+     *     </ul>
+     *   </li>
+     *   <li><b>Javassist失败降级</b>：
+     *     <ul>
+     *       <li>捕获Throwable异常（包括LinkageError、SecurityException等），尝试使用java.lang.reflect.Proxy.newProxyInstance生成JDK动态代理</li>
+     *       <li>记录ERROR日志说明Javassist失败但JDK代理成功，便于后续排查环境问题</li>
+     *     </ul>
+     *   </li>
+     *   <li><b>双重失败处理</b>：
+     *     <ul>
+     *       <li>如果JDK代理也失败，分别记录Javassist和JDK的错误日志，提供完整的故障诊断信息</li>
+     *       <li>抛出原始Javassist异常，中断Spring容器启动，提示用户检查类加载器配置或安全策略</li>
+     *     </ul>
+     *   </li>
+     * </ol>
+     * </p>
+     *
+     * @param interfaces 需要代理的接口列表，包含服务接口、Dubbo内部接口（EchoService等），决定代理对象的方法签名
+     */
     private void generateFromJavassistFirst(List<Class<?>> interfaces) {
         try {
             this.lazyProxy = Proxy.getProxy(interfaces.toArray(new Class[0]))
                     .newInstance(new LazyTargetInvocationHandler(new DubboReferenceLazyInitTargetSource()));
         } catch (Throwable fromJavassist) {
+            /*
+             * Javassist失败降级：
+             * 尝试使用JDK动态代理作为兜底方案，保证在受限环境下仍能正常工作
+             */
             // try fall back to JDK proxy factory
             try {
                 this.lazyProxy = java.lang.reflect.Proxy.newProxyInstance(
@@ -398,6 +482,10 @@ public class ReferenceBean<T>
                                 + "Interfaces: " + interfaces,
                         fromJavassist);
             } catch (Throwable fromJdk) {
+                /*
+                 * 双重失败处理：
+                 * 记录两种代理方式的错误日志，抛出原始异常中断启动
+                 */
                 logger.error(
                         PROXY_FAILED,
                         "",
@@ -435,8 +523,37 @@ public class ReferenceBean<T>
         }
     }
 
+    /**
+     * 获取RPC调用代理对象，处理懒加载场景下的ReferenceConfig初始化和同步控制。
+     * <p>
+     * 该方法是Dubbo Spring集成中懒加载机制的核心执行逻辑，在首次调用代理方法时被触发。
+     * 负责确保ReferenceConfig已正确初始化，并通过双重检查锁保证线程安全和避免重复初始化。
+     * </p>
+     * <p>
+     * 主要处理流程：
+     * <ol>
+     *   <li><b>空值检查与初始化</b>：
+     *     <ul>
+     *       <li>如果referenceConfig为null，说明Spring容器启动阶段未完成Bean的完整初始化</li>
+     *       <li>通过双重检查锁（DCL）模式，调用referenceBeanManager.initReferenceBean手动触发初始化</li>
+     *       <li>初始化DubboConfigApplicationListener确保配置监听器已就绪</li>
+     *       <li>记录WARN日志提醒用户应在Dubbo启动完成后才调用引用方法，避免时序问题</li>
+     *     </ul>
+     *   </li>
+     *   <li><b>快速获取</b>：如果referenceConfig已完成配置初始化且非懒加载场景，直接调用referenceConfig.get()返回代理，避免不必要的同步开销</li>
+     *   <li><b>同步获取</b>：在同步块中调用referenceConfig.get()，确保多线程环境下只创建一个Invoker代理实例，防止并发创建导致的资源浪费和状态不一致</li>
+     * </ol>
+     * </p>
+     *
+     * @return RPC代理对象，类型为服务接口，调用其方法时会通过网络远程执行提供者逻辑
+     * @throws Exception 当服务引用失败、注册中心连接异常、提供者不可用或配置错误时抛出异常
+     */
     private Object getCallProxy() throws Exception {
         if (referenceConfig == null) {
+            /*
+             * 延迟初始化保护：
+             * 当代理方法在Spring容器完全启动前被调用时，手动触发ReferenceConfig的初始化流程
+             */
             synchronized (LockUtils.getSingletonMutex(applicationContext)) {
                 if (referenceConfig == null) {
                     referenceBeanManager.initReferenceBean(this);
@@ -454,6 +571,10 @@ public class ReferenceBean<T>
                 }
             }
         }
+        /*
+         * 获取引用代理：
+         * 使用Spring容器的单例锁进行同步，避免与Spring自身的Bean创建逻辑产生死锁
+         */
         // get reference proxy
         // Subclasses should synchronize on the given Object if they perform any sort of extended singleton creation
         // phase.
@@ -469,10 +590,27 @@ public class ReferenceBean<T>
     }
 
     private class DubboReferenceLazyInitTargetSource implements LazyTargetSource {
-        @Override
-        public Object getTarget() throws Exception {
-            return getCallProxy();
-        }
+    /**
+     * 获取懒加载代理的目标对象，触发ReferenceConfig的初始化并返回RPC代理。
+     * <p>
+     * 该方法是LazyTargetSource接口的核心实现，在首次调用代理方法时被LazyTargetInvocationHandler触发。
+     * 负责延迟执行ReferenceConfig.get()完成服务引用、建立网络连接、创建Invoker链，最终返回可调用的RPC代理对象。
+     * </p>
+     * <p>
+     * 主要处理流程：
+     * <ol>
+     *   <li><b>委托调用</b>：直接调用getCallProxy()方法，该方法内部会检查ReferenceConfig是否已初始化，未初始化则执行完整的init流程</li>
+     *   <li><b>返回代理</b>：返回referenceConfig.get()生成的RPC代理对象，后续所有方法调用都会直接转发到该代理，不再经过懒加载逻辑</li>
+     * </ol>
+     * </p>
+     *
+     * @return RPC代理对象，类型为服务接口，调用其方法时会通过网络远程执行提供者逻辑
+     * @throws Exception 当服务引用失败、注册中心连接异常或提供者不可用时抛出异常
+     */
+    @Override
+    public Object getTarget() throws Exception {
+        return getCallProxy();
+    }
     }
 
     public void setInterfaceClass(Class<?> interfaceClass) {

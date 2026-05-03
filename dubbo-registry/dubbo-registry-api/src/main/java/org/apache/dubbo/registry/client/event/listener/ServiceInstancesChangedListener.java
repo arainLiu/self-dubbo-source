@@ -127,7 +127,40 @@ public class ServiceInstancesChangedListener {
     }
 
     /**
-     * @param event
+     * 处理服务实例变更事件，刷新本地缓存并通知所有订阅者更新Invoker。
+     * <p>
+     * 该方法是应用级服务发现地址变更的核心处理逻辑，当Zookeeper/Nacos等注册中心推送实例变化事件时被触发。
+     * 负责将原始实例列表按Revision分组、拉取元数据、构建URL缓存，最终通知所有接口的NotifyListener重建Invoker链。
+     * </p>
+     * <p>
+     * 主要处理流程：
+     * <ol>
+     *   <li><b>前置校验</b>：检查监听器是否已销毁、事件是否属于当前应用、是否为重试且已过期的事件，任一条件满足则直接返回</li>
+     *   <li><b>刷新实例缓存</b>：调用refreshInstance更新allInstances Map，维护应用名到实例列表的映射关系</li>
+     *   <li><b>按Revision分组</b>：遍历所有实例，根据exportedServicesRevision参数将同一版本的实例归类到一起，形成revisionToInstances Map</li>
+     *   <li><b>获取元数据</b>：
+     *     <ul>
+     *       <li>优先从现有实例的serviceMetadata中提取指定revision的MetadataInfo</li>
+     *       <li>如果本地没有，调用serviceDiscovery.getRemoteMetadata从远程元数据中心拉取（如Zookeeper/MetaServer）</li>
+     *       <li>将元数据回填到每个实例中，确保新创建的实例也能拿到完整的接口定义信息</li>
+     *     </ul>
+     *   </li>
+     *   <li><b>解析元数据</b>：调用parseMetadata从MetadataInfo中提取所有服务接口的ProtocolServiceKey，建立serviceInfo到revisions的映射</li>
+     *   <li><b>空元数据检查</b>：统计metadata为空的revision数量，如果全部为空则提交重试任务（5秒后重试），暂时不通知地址变更</li>
+     *   <li><b>构建URL缓存</b>：
+     *     <ul>
+     *       <li>遍历localServiceToRevisions，为每个ServiceInfo（接口+协议+端口）生成对应的URL列表</li>
+     *       <li>调用getServiceUrlsCache将revision对应的实例列表转换为Dubbo URL格式（如：tri://192.168.1.100:20880?revision=xxx）</li>
+     *       <li>按protocolServiceKey组织成newServiceUrls Map，便于后续快速查找</li>
+     *     </ul>
+     *   </li>
+     *   <li><b>更新缓存</b>：将newServiceUrls赋值给this.serviceUrls，替换旧的地址缓存</li>
+     *   <li><b>通知地址变更</b>：调用notifyAddressChanged遍历所有订阅的接口，触发Directory.refresh刷新Invoker链</li>
+     *   <li><b>重试机制</b>：如果仍有部分元数据为空，提交RetryTask到延迟队列，等待元数据中心恢复后重新拉取</li>
+     * </ol>
+     * </p>
+     *
+     * @param event 服务实例变更事件，包含应用名、新增/删除/更新的实例列表等信息，由注册中心事件监听器触发
      */
     private synchronized void doOnEvent(ServiceInstancesChangedEvent event) {
         if (destroyed.get() || !accept(event) || isRetryAndExpired(event)) {
@@ -143,7 +176,10 @@ public class ServiceInstancesChangedListener {
         Map<String, List<ServiceInstance>> revisionToInstances = new HashMap<>();
         Map<ServiceInfo, Set<String>> localServiceToRevisions = new HashMap<>();
 
-        // grouping all instances of this app(service name) by revision
+        /*
+         * 按Revision分组实例：
+         * 将同一应用下的所有实例按照metadata revision归类，相同revision的实例共享同一份元数据
+         */
         for (Map.Entry<String, List<ServiceInstance>> entry : allInstances.entrySet()) {
             List<ServiceInstance> instances = entry.getValue();
             for (ServiceInstance instance : instances) {
@@ -160,6 +196,10 @@ public class ServiceInstancesChangedListener {
             }
         }
 
+        /*
+         * 获取并填充元数据：
+         * 优先从本地实例缓存中获取MetadataInfo，缺失时从远程元数据中心拉取
+         */
         // get MetadataInfo with revision
         for (Map.Entry<String, List<ServiceInstance>> entry : revisionToInstances.entrySet()) {
             String revision = entry.getKey();
@@ -173,7 +213,10 @@ public class ServiceInstancesChangedListener {
                     .orElseGet(() -> serviceDiscovery.getRemoteMetadata(revision, subInstances));
 
             parseMetadata(revision, metadata, localServiceToRevisions);
-            // update metadata into each instance, in case new instance created.
+            /*
+             * 更新实例元数据：
+             * 确保每个实例都持有最新的MetadataInfo，新实例创建时能直接使用
+             */
             for (ServiceInstance tmpInstance : subInstances) {
                 MetadataInfo originMetadata = tmpInstance.getServiceMetadata();
                 if (originMetadata == null || !Objects.equals(originMetadata.getRevision(), metadata.getRevision())) {
@@ -182,6 +225,10 @@ public class ServiceInstancesChangedListener {
             }
         }
 
+        /*
+         * 空元数据检查：
+         * 如果所有revision的元数据都为空，说明元数据中心不可用，提交重试任务暂不通知
+         */
         int emptyNum = hasEmptyMetadata(revisionToInstances);
         if (emptyNum != 0) {
             hasEmptyMetadata = true;
@@ -202,6 +249,10 @@ public class ServiceInstancesChangedListener {
             hasEmptyMetadata = false;
         }
 
+        /*
+         * 构建URL缓存：
+         * 将revision分组转换为Dubbo URL格式，按protocolServiceKey组织便于后续路由和负载均衡使用
+         */
         Map<String, Map<Integer, Map<Set<String>, Object>>> protocolRevisionsToUrls = new HashMap<>();
         Map<String, List<ProtocolServiceKeyWithUrls>> newServiceUrls = new HashMap<>();
         for (Map.Entry<ServiceInfo, Set<String>> entry : localServiceToRevisions.entrySet()) {
@@ -223,6 +274,10 @@ public class ServiceInstancesChangedListener {
         }
 
         this.serviceUrls = newServiceUrls;
+        /*
+         * 通知所有订阅者：
+         * 触发Directory.refresh重建Invoker链，完成地址变更的最终生效
+         */
         this.notifyAddressChanged();
 
         if (hasEmptyMetadata) {

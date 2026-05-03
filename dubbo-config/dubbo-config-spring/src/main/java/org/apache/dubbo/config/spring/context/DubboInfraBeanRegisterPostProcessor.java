@@ -46,26 +46,38 @@ public class DubboInfraBeanRegisterPostProcessor implements BeanDefinitionRegist
         this.registry = registry;
     }
 
+    /**
+     * 在Spring容器标准初始化后处理BeanFactory，注册Dubbo基础设施Bean。
+     * <p>
+     * 该方法的处理逻辑：
+     * 1. 检查registry是否为空（兼容Spring 3.2.x版本的初始化顺序问题）；
+     * 2. 提前注册ReferenceAnnotationBeanPostProcessor，确保它能在PropertySourcesPlaceholderConfigurer之前处理@DubboReference注解；
+     * 3. 如果BeanFactory中不存在PropertySourcesPlaceholderConfigurer，则注册一个用于解析占位符；
+     * 4. 从BeanDefinition注册表中移除自身，避免循环引用和内存泄漏。
+     * </p>
+     *
+     * @param beanFactory Spring容器的BeanFactory实例，用于管理和获取Bean
+     * @throws BeansException 当Bean操作失败时抛出异常
+     */
     @Override
     public void postProcessBeanFactory(ConfigurableListableBeanFactory beanFactory) throws BeansException {
 
-        // In Spring 3.2.x, registry may be null because do not call postProcessBeanDefinitionRegistry method before
-        // postProcessBeanFactory
+        // 在Spring 3.2.x版本中，registry可能为null，因为postProcessBeanDefinitionRegistry方法可能在postProcessBeanFactory之后调用
         if (registry != null) {
-            // register ReferenceAnnotationBeanPostProcessor early before
-            // PropertySourcesPlaceholderConfigurer/PropertyPlaceholderConfigurer
-            // for processing early init ReferenceBean
+            // 提前注册ReferenceAnnotationBeanPostProcessor，确保它能在PropertySourcesPlaceholderConfigurer/PropertyPlaceholderConfigurer之前处理早期初始化的ReferenceBean
+            // 这样可以在占位符解析之前处理@DubboReference注解，支持URL中包含占位符的场景
             ReferenceAnnotationBeanPostProcessor referenceAnnotationBeanPostProcessor = beanFactory.getBean(
                     ReferenceAnnotationBeanPostProcessor.BEAN_NAME, ReferenceAnnotationBeanPostProcessor.class);
             beanFactory.addBeanPostProcessor(referenceAnnotationBeanPostProcessor);
 
-            // register PropertySourcesPlaceholderConfigurer bean if not exits
+            // 如果BeanFactory中不存在PropertySourcesPlaceholderConfigurer，则注册一个用于解析${...}占位符
             DubboBeanUtils.registerPlaceholderConfigurerBeanIfNotExists(beanFactory, registry);
         }
 
-        // fix https://github.com/apache/dubbo/issues/10278
+        // 修复 https://github.com/apache/dubbo/issues/10278：从注册表中移除自身Bean定义，防止循环引用和内存泄漏
         if (registry != null) {
             registry.removeBeanDefinition(BEAN_NAME);
         }
     }
+
 }

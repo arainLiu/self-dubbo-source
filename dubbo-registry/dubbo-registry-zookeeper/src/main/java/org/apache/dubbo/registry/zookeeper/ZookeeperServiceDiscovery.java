@@ -100,6 +100,7 @@ public class ZookeeperServiceDiscovery extends AbstractServiceDiscovery {
     @Override
     public void doRegister(ServiceInstance serviceInstance) {
         try {
+            //注册应用信息
             serviceDiscovery.registerService(build(serviceInstance));
         } catch (Exception e) {
             throw new RpcException(REGISTRY_EXCEPTION, "Failed register instance " + serviceInstance.toString(), e);
@@ -146,6 +147,26 @@ public class ZookeeperServiceDiscovery extends AbstractServiceDiscovery {
         return doInServiceDiscovery(s -> new LinkedHashSet<>(s.queryForNames()));
     }
 
+    /**
+     * 查询指定应用的所有服务实例列表，从Zookeeper读取注册的应用实例信息。
+     * <p>
+     * 该方法是Dubbo应用级服务发现的核心查询接口，负责从Zookeeper的服务发现路径中获取指定应用名下的所有实例地址。
+     * 通过Curator Framework的ServiceDiscovery API封装，将Zookeeper原生数据转换为Dubbo的ServiceInstance对象。
+     * </p>
+     * <p>
+     * 主要处理流程：
+     * <ol>
+     *   <li><b>委托执行</b>：调用doInServiceDiscovery在ServiceDiscovery上下文中执行查询操作，自动处理异常和资源管理</li>
+     *   <li><b>查询实例</b>：调用s.queryForInstances(serviceName)从Zookeeper读取指定应用名的所有实例节点，返回Curator的ServiceInstance列表</li>
+     *   <li><b>数据转换</b>：调用build方法将Curator ServiceInstance<ZookeeperInstance>转换为Dubbo ServiceInstance对象，提取主机、端口、元数据等信息</li>
+     *   <li><b>返回列表</b>：返回转换后的ServiceInstance列表，如果应用未注册或无实例则返回空列表（非null）</li>
+     * </ol>
+     * </p>
+     *
+     * @param serviceName 应用名称，即服务提供者的应用标识，用于在Zookeeper中定位对应的实例节点路径
+     * @return 服务实例列表，包含该应用所有已注册的实例地址和元数据信息，如果应用不存在则返回空列表
+     * @throws NullPointerException 当serviceName为null时抛出空指针异常
+     */
     @Override
     public List<ServiceInstance> getInstances(String serviceName) throws NullPointerException {
         return doInServiceDiscovery(s -> build(registryURL, s.queryForInstances(serviceName)));

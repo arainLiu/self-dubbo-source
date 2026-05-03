@@ -47,8 +47,25 @@ public class NettyEventLoopFactory {
                     () -> eventLoopGroup(Constants.DEFAULT_IO_THREADS, "NettyClientWorker"),
                     eventLoopGroup -> eventLoopGroup.shutdownGracefully());
 
+    /**
+     * 创建EventLoopGroup，根据操作系统环境自动选择Epoll或NIO实现。
+     * <p>
+     * 该方法的处理逻辑：
+     * 1. 创建专用的线程工厂，用于生成EventLoopGroup中的线程；
+     * 2. 通过shouldEpoll()判断当前系统是否支持且启用了Epoll（Linux系统专属）；
+     * 3. 如果支持Epoll，使用EpollEventLoopGroup（高性能的异步IO模型）；
+     * 4. 否则使用NioEventLoopGroup（基于Java NIO的标准实现）。
+     * </p>
+     *
+     * @param threads EventLoopGroup中的线程数量，决定并发处理能力
+     * @param threadFactoryName 线程工厂名称，用于线程命名和标识
+     * @return EventLoopGroup 根据系统环境选择的最佳EventLoopGroup实现（Epoll或NIO）
+     */
     public static EventLoopGroup eventLoopGroup(int threads, String threadFactoryName) {
+        // 创建线程工厂，第二个参数true表示守护线程模式
         ThreadFactory threadFactory = new DefaultThreadFactory(threadFactoryName, true);
+
+        // 根据系统环境判断是否使用Epoll（Linux系统的高性能IO多路复用机制），否则降级为NIO
         if (shouldEpoll()) {
             return new EpollEventLoopGroup(threads, threadFactory);
         } else {

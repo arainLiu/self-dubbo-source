@@ -54,32 +54,60 @@ public class FailoverClusterInvoker<T> extends AbstractClusterInvoker<T> {
         super(directory);
     }
 
+    /**
+     * 执行故障转移的RPC调用，支持自动重试和负载均衡。
+     * <p>
+     * 该方法是FailoverCluster的核心实现，处理流程包括：
+     * 1. 根据方法名计算最大调用次数（首次调用 + 重试次数）；
+     * 2. 循环执行调用，每次通过负载均衡器选择一个Invoker；
+     * 3. 重试前重新获取Invoker列表，避免服务提供者变化导致的不准确；
+     * 4. 捕获非业务异常进行重试，业务异常直接抛出；
+     * 5. 记录失败提供者的地址信息，最终抛出包含详细诊断信息的异常。
+     * </p>
+     *
+     * @param invocation RPC调用信息，包含方法名、参数等
+     * @param invokers 可用的服务提供者Invoker列表
+     * @param loadbalance 负载均衡策略，用于从多个Invoker中选择一个
+     * @return Result 调用成功的结果
+     * @throws RpcException 当所有重试都失败或发生业务异常时抛出
+     */
     @Override
     @SuppressWarnings({"unchecked", "rawtypes"})
     public Result doInvoke(Invocation invocation, final List<Invoker<T>> invokers, LoadBalance loadbalance)
             throws RpcException {
         List<Invoker<T>> copyInvokers = invokers;
         String methodName = RpcUtils.getMethodName(invocation);
+        // 根据方法配置计算最大调用次数（默认1次，可配置重试次数+1）
         int len = calculateInvokeTimes(methodName);
-        // retry loop.
+
+        // 初始化重试循环所需的变量：最后一次异常、已调用的Invoker列表、失败的提供者集合
         RpcException le = null; // last exception.
         List<Invoker<T>> invoked = new ArrayList<>(copyInvokers.size()); // invoked invokers.
         Set<String> providers = new HashSet<>(len);
+
+        // 执行最多len次的调用循环（首次 + 重试）
         for (int i = 0; i < len; i++) {
-            // Reselect before retry to avoid a change of candidate `invokers`.
-            // NOTE: if `invokers` changed, then `invoked` also lose accuracy.
+            // 重试前重新选择Invoker，避免服务提供者列表发生变化
+            // 注意：如果invokers发生变化，invoked列表的准确性会受到影响
             if (i > 0) {
                 checkWhetherDestroyed();
+                // 重新从目录获取最新的Invoker列表
                 copyInvokers = list(invocation);
-                // check again
+                // 验证新的Invoker列表是否有效
                 checkInvokers(copyInvokers, invocation);
             }
+
+            // 通过负载均衡器选择一个Invoker，排除已调用过的
             Invoker<T> invoker = select(loadbalance, invocation, copyInvokers, invoked);
             invoked.add(invoker);
             RpcContext.getServiceContext().setInvokers((List) invoked);
+
             boolean success = false;
             try {
+                // 执行实际的RPC调用
                 Result result = invokeWithContext(invoker, invocation);
+
+                // 如果之前有失败记录但本次成功，输出警告日志告知用户存在不稳定的提供者
                 if (le != null && logger.isWarnEnabled()) {
                     logger.warn(
                             CLUSTER_FAILED_MULTIPLE_RETRIES,
@@ -101,18 +129,24 @@ public class FailoverClusterInvoker<T> extends AbstractClusterInvoker<T> {
                 success = true;
                 return result;
             } catch (RpcException e) {
+                // 业务异常直接抛出，不进行重试
                 if (e.isBiz()) { // biz exception.
                     throw e;
                 }
+                // 非业务异常（如网络超时、连接拒绝）记录为最后一次异常，继续重试
                 le = e;
             } catch (Throwable e) {
+                // 其他异常包装为RpcException
                 le = new RpcException(e.getMessage(), e);
             } finally {
+                // 调用失败时，记录提供者的地址信息用于后续诊断
                 if (!success) {
                     providers.add(invoker.getUrl().getAddress());
                 }
             }
         }
+
+        // 所有重试都失败后，抛出包含详细信息的异常（包括尝试过的提供者列表、注册中心地址等）
         throw new RpcException(
                 le.getCode(),
                 "Failed to invoke the method "

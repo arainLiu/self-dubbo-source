@@ -40,6 +40,39 @@ public class DefaultFilterChainBuilder implements FilterChainBuilder {
     /**
      * build consumer/provider filter chain
      */
+    /**
+     * 构建消费者或服务提供者的过滤器链，将原始Invoker包装为具备横切关注点能力的增强Invoker。
+     * <p>
+     * 该方法是Dubbo RPC调用链的核心组装逻辑，负责根据URL配置和SPI激活机制，动态加载并组装所有需要的Filter（如日志、监控、限流、认证等）。
+     * 采用责任链模式，将多个Filter依次包装成嵌套的Invoker节点，形成从外到内的调用链路。
+     * </p>
+     * <p>
+     * 主要处理流程：
+     * <ol>
+     *   <li><b>获取模块模型</b>：调用getModuleModelsFromUrl从URL中提取关联的ModuleModel列表，用于确定Filter的加载范围（单模块或多模块场景）</li>
+     *   <li><b>加载激活的Filter</b>：
+     *     <ul>
+     *       <li>单模块场景：直接通过ScopeModelUtil.getExtensionLoader获取该模块的Filter扩展加载器，调用getActivateExtension(url, key, group)加载所有匹配的Filter</li>
+     *       <li>多模块场景：遍历所有ModuleModel，分别加载各自的Filter并合并，然后调用sortingAndDeduplication进行排序和去重，解决跨模块Filter的优先级冲突</li>
+     *       <li>无模块场景：使用全局ExtensionLoader加载Filter，作为兜底方案</li>
+     *     </ul>
+     *   </li>
+     *   <li><b>构建责任链</b>：
+     *     <ul>
+     *       <li>如果filters为空，直接返回原始originalInvoker，避免不必要的包装开销</li>
+     *       <li>从后往前遍历filters列表（保证order小的在外层），依次创建CopyOfFilterChainNode节点，每个节点持有下一个节点的引用和当前Filter对象</li>
+     *       <li>最终形成：Filter1(Filter2(Filter3(originalInvoker)))的嵌套结构</li>
+     *     </ul>
+     *   </li>
+     *   <li><b>注册回调</b>：将最外层的last节点和完整filters列表封装为CallbackRegistrationInvoker，负责在Exporter销毁时自动清理Filter资源</li>
+     * </ol>
+     * </p>
+     *
+     * @param originalInvoker 原始的Invoker对象，包含服务接口、实现类引用、URL配置等信息，是过滤器链的起点
+     * @param key             激活配置的参数键，服务端为"service.filter"，消费端为"reference.filter"，决定从哪些Filter中筛选
+     * @param group           分组标识，CommonConstants.PROVIDER或CommonConstants.CONSUMER，确保只加载对应端的Filter
+     * @return 经过过滤器链增强的Invoker对象，调用其invoke方法时会依次执行所有Filter的逻辑
+     */
     @Override
     public <T> Invoker<T> buildInvokerChain(final Invoker<T> originalInvoker, String key, String group) {
         Invoker<T> last = originalInvoker;
@@ -47,9 +80,17 @@ public class DefaultFilterChainBuilder implements FilterChainBuilder {
         List<ModuleModel> moduleModels = getModuleModelsFromUrl(url);
         List<Filter> filters;
         if (moduleModels != null && moduleModels.size() == 1) {
+            /*
+             * 单模块场景：
+             * 直接从当前模块的ExtensionLoader中加载激活的Filter
+             */
             filters = ScopeModelUtil.getExtensionLoader(Filter.class, moduleModels.get(0))
                     .getActivateExtension(url, key, group);
         } else if (moduleModels != null && moduleModels.size() > 1) {
+            /*
+             * 多模块场景：
+             * 合并所有模块的Filter，并进行排序和去重处理
+             */
             filters = new ArrayList<>();
             List<ExtensionDirector> directors = new ArrayList<>();
             for (ModuleModel moduleModel : moduleModels) {
@@ -61,10 +102,18 @@ public class DefaultFilterChainBuilder implements FilterChainBuilder {
             filters = sortingAndDeduplication(filters, directors);
 
         } else {
+            /*
+             * 无模块场景：
+             * 使用全局ExtensionLoader作为兜底方案
+             */
             filters = ScopeModelUtil.getExtensionLoader(Filter.class, null).getActivateExtension(url, key, group);
         }
 
         if (!CollectionUtils.isEmpty(filters)) {
+            /*
+             * 构建责任链：
+             * 从后往前遍历，将Filter依次包装成嵌套的Invoker节点
+             */
             for (int i = filters.size() - 1; i >= 0; i--) {
                 final Filter filter = filters.get(i);
                 final Invoker<T> next = last;

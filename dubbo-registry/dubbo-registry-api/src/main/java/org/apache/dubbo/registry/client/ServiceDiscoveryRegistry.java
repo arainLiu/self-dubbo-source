@@ -162,6 +162,7 @@ public class ServiceDiscoveryRegistry extends FailbackRegistry {
         if (!shouldRegister(url)) { // Should Not Register
             return;
         }
+        // 进行应用级别注册，这里将服务提供者数据转换到本地内存的元数据信息中
         doRegister(url);
     }
 
@@ -195,23 +196,60 @@ public class ServiceDiscoveryRegistry extends FailbackRegistry {
         doSubscribe(url, listener);
     }
 
+    /**
+     * 执行应用级服务发现的订阅操作，通过接口名映射查找应用实例并订阅地址变更。
+     * <p>
+     * 该方法是Dubbo3应用级服务发现的核心订阅逻辑，与传统的接口级订阅不同，它通过以下步骤实现：
+     * 先从元数据缓存中查询接口名到应用名的映射关系，然后订阅这些应用的所有实例地址。
+     * 支持动态监听映射变更，当有新应用注册同一接口时自动触发重新订阅。
+     * </p>
+     * <p>
+     * 主要处理流程：
+     * <ol>
+     *   <li><b>添加集群标识</b>：调用addRegistryClusterKey将注册中心集群信息附加到URL，支持多元数据中心场景</li>
+     *   <li><b>基础订阅</b>：调用serviceDiscovery.subscribe注册底层的实例变更监听器，建立与应用级注册中心的连接</li>
+     *   <li><b>本地缓存查询</b>：通过ServiceNameMapping.getMappingByUrl从本地缓存查找接口名对应的应用名集合，避免每次都访问远程元数据中心</li>
+     *   <li><b>加锁获取映射</b>：如果本地缓存未命中，通过mappingLock保证并发安全地从元数据中心拉取映射关系</li>
+     *   <li><b>注册映射监听器</b>：创建DefaultMappingListener并调用getAndListen，当元数据中心检测到新应用注册时触发回调重新订阅</li>
+     *   <li><b>初始化监听器状态</b>：调用updateInitialApps更新监听器的初始应用列表，确保后续事件推送基于准确的基准值</li>
+     *   <li><b>空值处理</b>：如果映射结果为空，记录INFO日志并直接返回，等待映射监听器异步回调触发订阅（不阻塞启动）</li>
+     *   <li><b>订阅地址</b>：调用subscribeURLs根据映射得到的应用名集合，订阅所有相关应用的实例地址列表</li>
+     * </ol>
+     * </p>
+     *
+     * @param url      订阅URL，包含服务接口名、版本、分组等信息，用于查询接口-应用映射关系
+     * @param listener 通知监听器，当应用实例地址变更或接口映射关系变化时触发回调，重新生成Invoker链
+     */
     @Override
     public void doSubscribe(URL url, NotifyListener listener) {
         url = addRegistryClusterKey(url);
 
         serviceDiscovery.subscribe(url, listener);
 
+        /*
+         * 查询接口-应用映射关系：
+         * 从本地缓存中查找该接口已经被哪些应用注册过
+         */
         Set<String> mappingByUrl = ServiceNameMapping.getMappingByUrl(url);
 
         String key = ServiceNameMapping.buildMappingKey(url);
 
         if (mappingByUrl == null) {
+            /*
+             * 加锁获取映射：
+             * 本地缓存未命中时，从元数据中心拉取并注册监听器，保证并发安全
+             */
             Lock mappingLock = serviceNameMapping.getMappingLock(key);
             try {
                 mappingLock.lock();
                 mappingByUrl = serviceNameMapping.getMapping(url);
                 try {
+                    /*
+                     * 注册映射变更监听器：
+                     * 当元数据中心检测到新应用注册同一接口时，触发回调重新订阅
+                     */
                     DefaultMappingListener mappingListener = new DefaultMappingListener(url, mappingByUrl, listener);
+                    //获取接口对应的应用名？
                     mappingByUrl = serviceNameMapping.getAndListen(this.getUrl(), url, mappingListener);
                     // update the initial mapping apps we started to listen, to make sure it reflects the real value
                     // used do subscription before any event.
@@ -232,6 +270,10 @@ public class ServiceDiscoveryRegistry extends FailbackRegistry {
                 }
 
                 if (CollectionUtils.isEmpty(mappingByUrl)) {
+                    /*
+                     * 空映射处理：
+                     * 没有应用注册该接口时，停止订阅并等待映射监听器异步回调
+                     */
                     logger.info(
                             "[METADATA_REGISTER] No interface-apps mapping found in local cache, stop subscribing, will automatically wait for mapping listener callback: "
                                     + url);
@@ -245,6 +287,10 @@ public class ServiceDiscoveryRegistry extends FailbackRegistry {
                 mappingLock.unlock();
             }
         }
+        /*
+         * 订阅应用实例地址：
+         * 根据映射得到的应用名集合，订阅所有相关应用的提供者地址
+         */
         subscribeURLs(url, listener, mappingByUrl);
     }
 
@@ -338,6 +384,30 @@ public class ServiceDiscoveryRegistry extends FailbackRegistry {
         return true;
     }
 
+    /**
+     * 订阅多个应用的实例地址变更，建立ServiceInstancesChangedListener与应用集合的映射关系。
+     * <p>
+     * 该方法是应用级服务发现的核心订阅逻辑，负责将接口级别的订阅请求转换为应用级别的实例监听。
+     * 通过共享ServiceInstancesChangedListener实现多个接口复用同一个应用实例监听器，避免重复订阅导致的资源浪费。
+     * </p>
+     * <p>
+     * 主要处理流程：
+     * <ol>
+     *   <li><b>参数转换</b>：将serviceNames转换为TreeSet保证顺序一致性，生成唯一的serviceNamesKey用于标识这一组应用</li>
+     *   <li><b>加锁保护</b>：通过getAppSubscription获取针对该应用集合的专属锁，防止并发创建多个监听器</li>
+     *   <li><b>查找或创建监听器</b>：从serviceListeners缓存中查找是否已有相同应用集合的监听器，没有则调用createListener创建新的</li>
+     *   <li><b>触发历史事件</b>：遍历所有应用，如果已有缓存的实例列表则立即触发onEvent回调，确保新监听器能获取到当前状态</li>
+     *   <li><b>注册监听关系</b>：调用addListenerAndNotify将当前接口的NotifyListener注册到ServiceInstancesChangedListener，并立即通知现有实例列表</li>
+     *   <li><b>全局注册</b>：通过addServiceInstancesChangedListener将监听器注册到ServiceDiscovery框架，接收来自注册中心的实例变更事件</li>
+     *   <li><b>指标上报</b>：通过MetricsEventBus发布订阅成功事件，记录监控数据用于运维统计</li>
+     *   <li><b>异常处理</b>：如果监听器已被其他线程销毁，移除缓存并记录日志，避免使用失效的监听器</li>
+     * </ol>
+     * </p>
+     *
+     * @param url           订阅URL，包含服务接口名、版本、分组等信息，用于标识哪个接口在订阅
+     * @param listener      接口级别的通知监听器，当监听到应用实例变更时会被回调触发Invoker重建
+     * @param serviceNames  需要订阅的应用名集合，这些应用都注册了当前接口，需要同时监听它们的实例变化
+     */
     protected void subscribeURLs(URL url, NotifyListener listener, Set<String> serviceNames) {
         serviceNames = toTreeSet(serviceNames);
         String serviceNamesKey = toStringKeys(serviceNames);
@@ -345,16 +415,28 @@ public class ServiceDiscoveryRegistry extends FailbackRegistry {
         logger.info(
                 String.format("Trying to subscribe from apps %s for service key %s, ", serviceNamesKey, serviceKey));
 
-        // register ServiceInstancesChangedListener
+        /*
+         * 加锁保护应用订阅：
+         * 确保同一组应用只创建一个ServiceInstancesChangedListener，避免重复订阅
+         */
         Lock appSubscriptionLock = getAppSubscription(serviceNamesKey);
         try {
             appSubscriptionLock.lock();
             ServiceInstancesChangedListener serviceInstancesChangedListener = serviceListeners.get(serviceNamesKey);
             if (serviceInstancesChangedListener == null) {
+                /*
+                 * 创建新的应用实例监听器：
+                 * 监听这组应用的所有实例变更事件
+                 */
                 serviceInstancesChangedListener = serviceDiscovery.createListener(serviceNames);
                 for (String serviceName : serviceNames) {
+                    // 根据服务名称获取当前应用实例列表，从/services/<serviceName>/节点获取
                     List<ServiceInstance> serviceInstances = serviceDiscovery.getInstances(serviceName);
                     if (CollectionUtils.isNotEmpty(serviceInstances)) {
+                        /*
+                         * 触发历史事件：
+                         * 将当前已知的实例列表推送给新创建的监听器，确保初始化时就有完整的地址信息
+                         */
                         serviceInstancesChangedListener.onEvent(
                                 new ServiceInstancesChangedEvent(serviceName, serviceInstances));
                     }
@@ -363,6 +445,10 @@ public class ServiceDiscoveryRegistry extends FailbackRegistry {
             }
 
             if (!serviceInstancesChangedListener.isDestroyed()) {
+                /*
+                 * 注册接口级监听器：
+                 * 将当前接口的NotifyListener关联到应用级监听器，当应用实例变更时会同时通知所有订阅该应用的接口
+                 */
                 listener.addServiceListener(serviceInstancesChangedListener);
                 serviceInstancesChangedListener.addListenerAndNotify(url, listener);
                 ServiceInstancesChangedListener finalServiceInstancesChangedListener = serviceInstancesChangedListener;
@@ -370,6 +456,10 @@ public class ServiceDiscoveryRegistry extends FailbackRegistry {
                 String serviceDiscoveryName =
                         url.getParameter(RegistryConstants.REGISTRY_CLUSTER_KEY, url.getProtocol());
 
+                /*
+                 * 全局注册并上报指标：
+                 * 将监听器注册到ServiceDiscovery框架，开始接收注册中心的实时事件推送
+                 */
                 MetricsEventBus.post(
                         RegistryEvent.toSsEvent(
                                 url.getApplicationModel(), serviceKey, Collections.singletonList(serviceDiscoveryName)),
@@ -378,6 +468,10 @@ public class ServiceDiscoveryRegistry extends FailbackRegistry {
                             return null;
                         });
             } else {
+                /*
+                 * 监听器已销毁处理：
+                 * 清理缓存避免内存泄漏，后续订阅会重新创建新的监听器
+                 */
                 logger.info(String.format("Listener of %s has been destroyed by another thread.", serviceNamesKey));
                 serviceListeners.remove(serviceNamesKey);
             }

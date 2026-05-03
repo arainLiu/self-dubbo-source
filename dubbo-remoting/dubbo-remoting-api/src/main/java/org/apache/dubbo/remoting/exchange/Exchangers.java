@@ -50,16 +50,37 @@ public class Exchangers {
         return bind(URL.valueOf(url), handler);
     }
 
+    /**
+     * 绑定URL地址并创建ExchangeServer，提供请求-响应模式的网络服务。
+     * <p>
+     * 该方法是ExchangeServer的工厂方法，负责：
+     * 1. 验证参数合法性（URL和Handler不能为空）；
+     * 2. 为URL添加默认的exchange编解码器标识；
+     * 3. 根据URL配置选择对应的Exchanger扩展实现；
+     * 4. 调用Exchanger.bind完成服务器绑定。
+     * </p>
+     *
+     * @param url 服务器绑定的URL地址，包含host、port、编解码器等配置信息
+     * @param handler 交换层处理器，负责处理客户端请求并返回响应结果
+     * @return ExchangeServer对象，支持双向通信的网络服务器实例
+     * @throws IllegalArgumentException 当URL或handler参数为空时抛出
+     * @throws RemotingException 当服务器绑定失败（如端口被占用、网络异常等）时抛出
+     */
     public static ExchangeServer bind(URL url, ExchangeHandler handler) throws RemotingException {
+        // 参数校验：确保URL和ExchangeHandler不为空
         if (url == null) {
             throw new IllegalArgumentException("url == null");
         }
         if (handler == null) {
             throw new IllegalArgumentException("handler == null");
         }
+
+        // 为URL添加默认的exchange编解码器（用于区分传输层和交换层的编码逻辑）
         url = url.addParameterIfAbsent(Constants.CODEC_KEY, "exchange");
+        // 根据URL配置获取对应的Exchanger扩展实现（如HeaderExchanger），执行实际的服务器绑定操作
         return getExchanger(url).bind(url, handler);
     }
+
 
     public static ExchangeClient connect(String url) throws RemotingException {
         return connect(URL.valueOf(url));

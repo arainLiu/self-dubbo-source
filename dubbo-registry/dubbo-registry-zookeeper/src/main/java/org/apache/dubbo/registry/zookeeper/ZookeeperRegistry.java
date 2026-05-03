@@ -187,11 +187,47 @@ public class ZookeeperRegistry extends CacheableFailbackRegistry {
         }
     }
 
+    /**
+     * 执行Zookeeper订阅操作，监听服务提供者地址和配置规则的变更。
+     * <p>
+     * 该方法是Dubbo与Zookeeper集成的核心订阅逻辑，支持两种订阅模式：
+     * </p>
+     * <p>
+     * <b>1. 全量服务订阅（interface="*"）：</b>
+     * 当url的serviceInterface为"*"时，订阅根节点下所有服务接口，实现自动发现新服务的功能。
+     * 监听/dubbo节点的子节点变化，当有新服务上线时自动触发递归订阅。
+     * </p>
+     * <p>
+     * <b>2. 单服务订阅（默认模式）：</b>
+     * 订阅指定接口的providers、configurators、routers等分类节点，监听提供者地址变更和动态配置推送。
+     * 通过CountDownLatch保证主线程同步通知完成后才触发异步回调，避免竞态条件。
+     * </p>
+     * <p>
+     * 主要处理流程（单服务订阅）：
+     * <ol>
+     *   <li><b>构建分类路径</b>：调用toCategoriesPath生成需要订阅的Zookeeper节点路径列表（如：/dubbo/interface/providers）</li>
+     *   <li><b>创建监听器</b>：为每个分类路径创建RegistryChildListenerImpl，当子节点变化时触发notify回调</li>
+     *   <li><b>创建目录</b>：调用zkClient.create确保订阅的父节点存在，即使当前没有提供者也不会报错</li>
+     *   <li><b>添加子节点监听</b>：调用zkClient.addChildListener注册Watcher，监听提供者上下线事件</li>
+     *   <li><b>地址转换</b>：调用toUrlsWithEmpty将Zookeeper子节点列表转换为URL对象，空节点表示禁用该分类</li>
+     *   <li><b>同步通知</b>：在主线程中立即调用notify，使用当前获取的地址列表初始化Invoker链</li>
+     *   <li><b>释放锁存器</b>：在finally块中调用latch.countDown，允许监听器异步回调执行后续逻辑</li>
+     * </ol>
+     * </p>
+     *
+     * @param url      订阅URL，包含服务接口名、版本、分组、分类等信息，决定订阅哪些Zookeeper节点
+     * @param listener 通知监听器，当Zookeeper节点变化时触发回调，重新生成Invoker链并更新路由规则
+     * @throws RpcException 当Zookeeper连接失败、节点创建异常或订阅操作出错时抛出RPC异常
+     */
     @Override
     public void doSubscribe(final URL url, final NotifyListener listener) {
         try {
             checkDestroyed();
             if (ANY_VALUE.equals(url.getServiceInterface())) {
+                /*
+                 * 全量服务订阅模式：
+                 * 监听/dubbo根节点，自动发现并订阅所有已注册的服务接口
+                 */
                 String root = toRootPath();
                 boolean check = url.getParameter(CHECK_KEY, false);
                 ConcurrentMap<NotifyListener, ChildListener> listeners =
@@ -238,6 +274,10 @@ public class ZookeeperRegistry extends CacheableFailbackRegistry {
                     }
                 }
             } else {
+                /*
+                 * 单服务订阅模式：
+                 * 订阅指定接口的providers/configurators/routers节点
+                 */
                 CountDownLatch latch = new CountDownLatch(1);
 
                 try {
@@ -261,9 +301,17 @@ public class ZookeeperRegistry extends CacheableFailbackRegistry {
                             ((RegistryChildListenerImpl) zkListener).setLatch(latch);
                         }
 
+                        /*
+                         * 创建目录节点：
+                         * 确保订阅的父节点存在，即使当前没有提供者也不会报错
+                         */
                         // create "directories".
                         zkClient.create(path, false, true);
 
+                        /*
+                         * 添加子节点监听：
+                         * 注册Watcher监听提供者上下线事件，触发时调用RegistryChildListenerImpl.childChanged
+                         */
                         // Add children (i.e. service items).
                         List<String> children = zkClient.addChildListener(path, zkListener);
                         if (children != null) {
@@ -272,8 +320,16 @@ public class ZookeeperRegistry extends CacheableFailbackRegistry {
                         }
                     }
 
+                    /*
+                     * 同步通知：
+                     * 在主线程中立即使用当前地址列表初始化Invoker，保证订阅完成后立即可用
+                     */
                     notify(url, listener, urls);
                 } finally {
+                    /*
+                     * 释放锁存器：
+                     * 告诉监听器主线程的同步通知已完成，可以执行异步回调逻辑
+                     */
                     // tells the listener to run only after the sync notification of main thread finishes.
                     latch.countDown();
                 }

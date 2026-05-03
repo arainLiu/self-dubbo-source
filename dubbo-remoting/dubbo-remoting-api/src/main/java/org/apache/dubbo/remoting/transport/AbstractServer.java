@@ -49,25 +49,47 @@ public abstract class AbstractServer extends AbstractEndpoint implements Remotin
 
     private ExecutorRepository executorRepository;
 
+    /**
+     * 创建并初始化AbstractServer，绑定网络地址并启动服务器监听。
+     * <p>
+     * 该构造函数的处理流程：
+     * 1. 调用父类构造函数保存URL和handler引用；
+     * 2. 获取ExecutorRepository用于管理线程池；
+     * 3. 解析绑定的IP地址和端口（支持ANYHOST配置和无效本地地址的兜底处理）；
+     * 4. 调用doOpen()模板方法执行具体的服务器启动逻辑（由子类实现）；
+     * 5. 创建或获取服务器专用的线程池。
+     * </p>
+     *
+     * @param url 服务器配置的URL对象，包含绑定地址、端口、线程池参数等信息
+     * @param handler ChannelHandler处理器，负责处理网络连接、消息接收和事件回调
+     * @throws RemotingException 当服务器启动失败（如端口被占用、网络异常等）时抛出
+     */
     public AbstractServer(URL url, ChannelHandler handler) throws RemotingException {
+        // 调用父类AbstractPeer构造函数，保存URL和handler引用
         super(url, handler);
+        // 获取ExecutorRepository实例，用于管理和创建线程池
         executorRepository = ExecutorRepository.getInstance(url.getOrDefaultApplicationModel());
         localAddress = getUrl().toInetSocketAddress();
 
+        // 解析绑定IP：优先使用BIND_IP_KEY配置，其次使用URL的host；如果配置了ANYHOST或本地地址无效，则使用0.0.0.0
         String bindIp = getUrl().getParameter(Constants.BIND_IP_KEY, getUrl().getHost());
         int bindPort = getUrl().getParameter(Constants.BIND_PORT_KEY, getUrl().getPort());
         if (url.getParameter(ANYHOST_KEY, false) || NetUtils.isInvalidLocalHost(bindIp)) {
             bindIp = ANYHOST_VALUE;
         }
         bindAddress = new InetSocketAddress(bindIp, bindPort);
+        // 设置服务器可接受的最大连接数（默认值由DEFAULT_ACCEPTS定义）
         this.accepts = url.getParameter(ACCEPTS_KEY, DEFAULT_ACCEPTS);
+
         try {
+            // 调用模板方法doOpen()执行具体的服务器启动逻辑（如Netty服务器的bind操作）
             doOpen();
             if (logger.isInfoEnabled()) {
                 logger.info("[SERVICE_PUBLISH][METADATA_REGISTER] Start "
                         + getClass().getSimpleName() + " bind " + getBindAddress() + ", export " + getLocalAddress());
             }
         } catch (Throwable t) {
+            // 启动失败时抛出RemotingException，包含绑定地址和异常原因
             throw new RemotingException(
                     url.toInetSocketAddress(),
                     null,
@@ -75,9 +97,12 @@ public abstract class AbstractServer extends AbstractEndpoint implements Remotin
                             + t.getMessage(),
                     t);
         }
+
+        // 为服务器创建或获取专用线程池，设置线程名称并使用ExecutorRepository统一管理
         executors.add(
                 executorRepository.createExecutorIfAbsent(ExecutorUtil.setThreadName(url, SERVER_THREAD_POOL_NAME)));
     }
+
 
     protected abstract void doOpen() throws Throwable;
 

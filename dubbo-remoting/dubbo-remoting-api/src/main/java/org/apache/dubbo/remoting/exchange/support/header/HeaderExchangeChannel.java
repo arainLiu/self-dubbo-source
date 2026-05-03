@@ -131,32 +131,59 @@ final class HeaderExchangeChannel implements ExchangeChannel {
         return request(request, channel.getUrl().getPositiveParameter(TIMEOUT_KEY, DEFAULT_TIMEOUT), executor);
     }
 
+    /**
+     * 发送请求并返回异步结果Future，实现请求-响应模式的网络通信。
+     * <p>
+     * 该方法的处理流程：
+     * 1. 检查通道是否已关闭，防止在关闭状态下发送请求；
+     * 2. 将请求对象包装为Request对象（如果还不是Request类型），设置协议版本、双向通信标识和数据内容；
+     * 3. 创建DefaultFuture对象，用于关联请求ID和后续的响应结果；
+     * 4. 通过底层Channel发送Request消息；
+     * 5. 如果发送失败，取消Future并抛出异常；
+     * 6. 返回DefaultFuture供调用者等待异步结果。
+     * </p>
+     *
+     * @param request 请求数据对象，可以是任意类型（会被包装为Request）或已经是Request类型
+     * @param timeout 超时时间（毫秒），用于控制等待响应的最长时间
+     * @param executor 执行回调的线程池，用于处理响应到达后的异步通知逻辑
+     * @return CompletableFuture<Object> 异步返回的响应结果，调用者可通过get()方法阻塞等待
+     * @throws RemotingException 当通道已关闭或发送请求失败时抛出异常
+     */
     @Override
     public CompletableFuture<Object> request(Object request, int timeout, ExecutorService executor)
             throws RemotingException {
+        // 检查通道状态：如果已关闭则直接抛出异常，避免无效的网络操作
         if (closed) {
             throw new RemotingException(
                     this.getLocalAddress(),
                     null,
                     "Failed to send request " + request + ", cause: The channel " + this + " is closed!");
         }
+
         Request req;
+        // 如果请求对象已经是Request类型则直接使用，否则包装为标准的Request对象
         if (request instanceof Request) {
             req = (Request) request;
         } else {
-            // create request.
+            // 创建Request对象并设置必要属性：协议版本、双向通信标志（true表示需要响应）、请求数据
             req = new Request();
             req.setVersion(Version.getProtocolVersion());
             req.setTwoWay(true);
             req.setData(request);
         }
+
+        // 创建DefaultFuture对象，建立请求ID与响应的关联关系，用于异步接收响应结果
         DefaultFuture future = DefaultFuture.newFuture(channel, req, timeout, executor);
         try {
+            // 通过底层Channel发送Request消息到服务端
             channel.send(req);
         } catch (RemotingException e) {
+            // 发送失败时取消Future，清理等待队列中的相关资源
             future.cancel();
             throw e;
         }
+
+        // 返回异步Future对象，调用者可以通过它等待和处理响应结果
         return future;
     }
 

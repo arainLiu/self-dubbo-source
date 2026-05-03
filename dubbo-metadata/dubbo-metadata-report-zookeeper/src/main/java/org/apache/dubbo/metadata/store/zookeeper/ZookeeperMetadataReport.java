@@ -158,15 +158,47 @@ public class ZookeeperMetadataReport extends AbstractMetadataReport {
         return JsonUtils.toJavaObject(content, MetadataInfo.class);
     }
 
+    /**
+     * 从Zookeeper查询接口名到应用名的映射关系并注册监听器，支持动态感知映射变更。
+     * <p>
+     * 该方法是ZookeeperMetadataReport的核心订阅实现，负责从Zookeeper节点读取映射数据并注册Watcher监听器。
+     * 通过casListenerMap实现监听器的复用和缓存，避免对同一路径重复注册Zookeeper Watcher导致资源浪费。
+     * </p>
+     * <p>
+     * 主要处理流程：
+     * <ol>
+     *   <li><b>构建Zookeeper路径</b>：调用buildPathKey生成完整的Zookeeper节点路径，格式为：/{group}/{serviceKey}（如：/dubbo/interface:version@group）</li>
+     *   <li><b>查找或创建CAS监听器</b>：从casListenerMap中查找是否已有该路径的MappingDataListener，没有则创建新的并注册到Zookeeper客户端</li>
+     *   <li><b>Zookeeper Watcher注册</b>：调用zkClient.addDataListener注册Watcher，当节点内容变化时触发MappingDataListener.childChanged回调</li>
+     *   <li><b>添加业务监听器</b>：将传入的MappingListener添加到MappingDataListener的内部列表中，实现一对多的事件分发</li>
+     *   <li><b>读取当前数据</b>：调用zkClient.getContent读取Zookeeper节点的当前内容，返回逗号分隔的应用名列表字符串</li>
+     *   <li><b>解析并返回</b>：调用getAppNames将字符串解析为Set<String>格式的应用名集合，返回给调用方</li>
+     * </ol>
+     * </p>
+     *
+     * @param serviceKey 服务接口的唯一标识，格式为：interface:version@group，用于构建Zookeeper节点路径
+     * @param listener   映射变更监听器，当Zookeeper节点内容变化时触发回调，通知消费者重新订阅新应用的实例地址
+     * @param url        服务URL，包含注册中心连接信息和查询参数，用于构建路径和路由
+     * @return 已注册该接口的应用名集合，如果节点不存在或内容为空则返回空集合
+     */
     @Override
     public Set<String> getServiceAppMapping(String serviceKey, MappingListener listener, URL url) {
         String path = buildPathKey(DEFAULT_MAPPING_GROUP, serviceKey);
+        /*
+         * 复用CAS监听器：
+         * 确保同一Zookeeper路径只注册一个Watcher，避免重复监听导致的性能问题
+         */
         MappingDataListener mappingDataListener = ConcurrentHashMapUtils.computeIfAbsent(casListenerMap, path, _k -> {
             MappingDataListener newMappingListener = new MappingDataListener(serviceKey, path);
             zkClient.addDataListener(path, newMappingListener);
             return newMappingListener;
         });
+        /*
+         * 添加业务层监听器：
+         * 将上层传入的MappingListener注册到MappingDataListener，实现事件的分发和转发
+         */
         mappingDataListener.addListener(listener);
+        //通过zk获取数据信息
         return getAppNames(zkClient.getContent(path));
     }
 

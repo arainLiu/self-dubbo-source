@@ -136,6 +136,33 @@ public class ReferenceAnnotationBeanPostProcessor extends AbstractAnnotationBean
         }
     }
 
+    /**
+     * 处理Spring Bean工厂中的所有@DubboReference注解，完成依赖注入的准备工作。
+     * <p>
+     * 该方法是Spring Bean生命周期回调接口BeanFactoryPostProcessor的核心实现，在Spring容器初始化Bean定义后、实例化Bean之前执行。
+     * 负责扫描所有Bean定义，查找带有@DubboReference注解的字段和方法，预创建ReferenceConfig并缓存，加速后续的实际注入过程。
+     * </p>
+     * <p>
+     * 主要处理流程：
+     * <ol>
+     *   <li><b>遍历Bean定义</b>：获取beanFactory中所有Bean的名称数组，逐个检查是否需要处理@DubboReference注解</li>
+     *   <li><b>FactoryBean特殊处理</b>：
+     *     <ul>
+     *       <li>如果是ReferenceBean类型（通过XML或Java Config定义的<dubbo:reference>），跳过不处理，避免重复注入</li>
+     *       <li>如果是带有@DubboReference注解的@Bean方法返回类型，调用processReferenceAnnotatedBeanDefinition处理Java Config场景</li>
+     *       <li>其他FactoryBean则解析其beanClassName获取实际类型</li>
+     *     </ul>
+     *   </li>
+     *   <li><b>查找注入元数据</b>：调用findInjectionMetadata反射扫描类结构，提取所有@DubboReference标注的字段和方法，构建AnnotatedInjectionMetadata对象</li>
+     *   <li><b>准备注入</b>：调用prepareInjection为每个@DubboReference创建ReferenceConfig实例，建立serviceKey到ReferenceConfig的映射关系，但不立即建立RPC连接（延迟到首次get时）</li>
+     *   <li><b>自我清理</b>：如果当前处理器已注册为BeanPostProcessor，从beanDefinitionRegistry中移除自身定义，避免被Spring再次注册导致BeanPostProcessorChecker误报</li>
+     *   <li><b>发布初始化事件</b>：触发DubboConfigInitEvent通知监听器Dubbo配置已加载完成，低版本Spring（<4.2）不支持早期事件时记录警告日志</li>
+     * </ol>
+     * </p>
+     *
+     * @param beanFactory Spring的Bean工厂对象，包含所有Bean定义和依赖关系，用于扫描和预处理@DubboReference注解
+     * @throws BeansException 当Bean定义解析失败、类加载异常或ReferenceConfig创建出错时抛出Spring容器异常
+     */
     @Override
     public void postProcessBeanFactory(ConfigurableListableBeanFactory beanFactory) throws BeansException {
 
@@ -148,6 +175,10 @@ public class ReferenceAnnotationBeanPostProcessor extends AbstractAnnotationBean
                     continue;
                 }
                 if (isAnnotatedReferenceBean(beanDefinition)) {
+                    /*
+                     * 处理Java Config中的@DubboReference：
+                     * 支持在@Configuration类的@Bean方法参数上使用@DubboReference注解
+                     */
                     // process @DubboReference at java-config @bean method
                     processReferenceAnnotatedBeanDefinition(beanName, (AnnotatedBeanDefinition) beanDefinition);
                     continue;
@@ -161,6 +192,10 @@ public class ReferenceAnnotationBeanPostProcessor extends AbstractAnnotationBean
             if (beanType != null) {
                 AnnotatedInjectionMetadata metadata = findInjectionMetadata(beanName, beanType, null);
                 try {
+                    /*
+                     * 准备Dubbo引用注入：
+                     * 为每个@DubboReference创建ReferenceConfig并缓存，但此时不建立RPC连接
+                     */
                     prepareInjection(metadata);
                 } catch (BeansException e) {
                     throw e;
@@ -174,6 +209,11 @@ public class ReferenceAnnotationBeanPostProcessor extends AbstractAnnotationBean
             List<BeanPostProcessor> beanPostProcessors = ((AbstractBeanFactory) beanFactory).getBeanPostProcessors();
             for (BeanPostProcessor beanPostProcessor : beanPostProcessors) {
                 if (beanPostProcessor == this) {
+                    /*
+                     * 自我清理：
+                     * 当前处理器已通过DubboInfraBeanRegisterPostProcessor注册为BeanPostProcessor，
+                     * 此处移除Bean定义防止Spring将其再次注册为普通Bean导致检测错误
+                     */
                     // This bean has been registered as BeanPostProcessor at
                     // org.apache.dubbo.config.spring.context.DubboInfraBeanRegisterPostProcessor.postProcessBeanFactory()
                     // so destroy this bean here, prevent register it as BeanPostProcessor again, avoid cause
@@ -185,6 +225,10 @@ public class ReferenceAnnotationBeanPostProcessor extends AbstractAnnotationBean
         }
 
         try {
+            /*
+             * 发布Dubbo配置初始化事件：
+             * 通知监听器Dubbo配置已加载完成，可以开始执行依赖于此的初始化逻辑
+             */
             // this is an early event, it will be notified at
             // org.springframework.context.support.AbstractApplicationContext.registerListeners()
             applicationContext.publishEvent(new DubboConfigInitEvent(applicationContext));
@@ -197,6 +241,9 @@ public class ReferenceAnnotationBeanPostProcessor extends AbstractAnnotationBean
                     "publish early application event failed, please upgrade spring version to 4.2.x or later: " + e);
         }
     }
+
+    // ... existing code ...
+
 
     /**
      * check whether is @DubboReference at java-config @bean method
@@ -376,9 +423,45 @@ public class ReferenceAnnotationBeanPostProcessor extends AbstractAnnotationBean
         return ReferenceBean.class.getName().equals(beanDefinition.getBeanClassName());
     }
 
+    /**
+     * 预处理@DubboReference注解的注入元数据，注册ReferenceBean并缓存关联关系。
+     * <p>
+     * 该方法是Dubbo Spring集成中依赖注入准备阶段的核心逻辑，负责扫描类中的所有@DubboReference标注字段和方法，
+     * 为每个引用创建唯一的ReferenceBean定义，建立注入点与Bean名称的映射关系，加速后续的实际注入过程。
+     * </p>
+     * <p>
+     * 主要处理流程：
+     * <ol>
+     *   <li><b>处理字段注入</b>：
+     *     <ul>
+     *       <li>遍历metadata.getFieldElements()获取所有@DubboReference标注的字段</li>
+     *       <li>跳过已处理的字段（injectedObject != null），保证幂等性</li>
+     *       <li>提取字段类型作为服务接口，从注解属性中获取group、version、timeout等配置</li>
+     *       <li>调用registerReferenceBean创建或复用ReferenceBean，返回唯一的Bean名称</li>
+     *       <li>将referenceBeanName赋值给fieldElement.injectedObject建立关联，同时存入injectedFieldReferenceBeanCache缓存</li>
+     *     </ul>
+     *   </li>
+     *   <li><b>处理方法注入</b>：
+     *     <ul>
+     *       <li>遍历metadata.getMethodElements()获取所有@DubboReference标注的setter方法</li>
+     *       <li>跳过已处理的方法，提取方法参数类型作为服务接口</li>
+     *       <li>调用registerReferenceBean创建ReferenceBean，处理方式级别的注解属性合并</li>
+     *       <li>将referenceBeanName赋值给methodElement.injectedObject，存入injectedMethodReferenceBeanCache缓存</li>
+     *     </ul>
+     *   </li>
+     *   <li><b>异常处理</b>：捕获ClassNotFoundException（如服务接口类不存在），包装为BeanCreationException抛出，中断Spring容器启动</li>
+     * </ol>
+     * </p>
+     *
+     * @param metadata 注解注入元数据对象，包含目标类的所有@DubboReference字段和方法信息，由findInjectionMetadata通过反射扫描生成
+     * @throws BeansException 当服务接口类加载失败、ReferenceBean注册异常或配置冲突时抛出Spring容器异常
+     */
     protected void prepareInjection(AnnotatedInjectionMetadata metadata) throws BeansException {
         try {
-            // find and register bean definition for @DubboReference/@Reference
+            /*
+             * 处理字段级别的@DubboReference注入：
+             * 为每个字段注册ReferenceBean并建立双向关联
+             */
             for (AnnotatedFieldElement fieldElement : metadata.getFieldElements()) {
                 if (fieldElement.injectedObject != null) {
                     continue;
@@ -393,14 +476,18 @@ public class ReferenceAnnotationBeanPostProcessor extends AbstractAnnotationBean
                 injectedFieldReferenceBeanCache.put(fieldElement, referenceBeanName);
             }
 
+            /*
+             * 处理方法级别的@DubboReference注入：
+             * 支持setter方法注入，处理方式参数的注解属性
+             */
             for (AnnotatedMethodElement methodElement : metadata.getMethodElements()) {
                 if (methodElement.injectedObject != null) {
                     continue;
                 }
                 Class<?> injectedType = methodElement.getInjectedType();
                 AnnotationAttributes attributes = methodElement.attributes;
-                String referenceBeanName = registerReferenceBean(
-                        methodElement.getPropertyName(), injectedType, attributes, methodElement.method);
+                // register reference bean
+                String referenceBeanName = registerReferenceBean(methodElement.getPropertyName(), injectedType, attributes, methodElement.method);
 
                 // associate methodElement and reference bean
                 methodElement.injectedObject = referenceBeanName;
@@ -411,6 +498,56 @@ public class ReferenceAnnotationBeanPostProcessor extends AbstractAnnotationBean
         }
     }
 
+    /**
+     * 注册ReferenceBean定义到Spring容器，处理命名冲突和重复注册逻辑。
+     * <p>
+     * 该方法是Dubbo Spring集成中Bean注册的核心逻辑，负责将@DubboReference注解转换为Spring的BeanDefinition并注册到容器。
+     * 支持自动重命名解决冲突、相同配置复用、别名映射等高级特性，确保每个唯一的接口+版本+分组组合只创建一个ReferenceBean实例。
+     * </p>
+     * <p>
+     * 主要处理流程：
+     * <ol>
+     *   <li><b>确定Bean名称</b>：
+     *     <ul>
+     *       <li>优先使用注解中指定的id属性作为Bean名称，此时不允许自动重命名</li>
+     *       <li>如果未指定id，使用字段名或方法参数名作为默认Bean名称，允许后续冲突时自动重命名</li>
+     *     </ul>
+     *   </li>
+     *   <li><b>属性转换</b>：调用ReferenceBeanSupport.convertReferenceProps将注解属性转换为ReferenceConfig所需的配置格式，推断接口名</li>
+     *   <li><b>接口名校验</b>：检查interfaceName是否为空，泛化调用时必须显式指定interfaceName或interfaceClass</li>
+     *   <li><b>生成引用键</b>：调用ReferenceBeanSupport.generateReferenceKey生成唯一标识（格式：interface:version@group），用于判断是否为重复配置</li>
+     *   <li><b>查找已注册Bean</b>：通过referenceBeanManager.getBeanNamesByKey(referenceKey)查询是否已有相同配置的ReferenceBean</li>
+     *   <li><b>冲突检测与处理</b>：
+     *     <ul>
+     *       <li>如果当前Bean名称已被占用且类型不同：
+     *         <ul>
+     *           <li>不可重命名场景（指定了id或Java Config Bean）：抛出BeanCreationException异常，要求用户手动修改名称</li>
+     *           <li>可重命名场景：自动追加"#2"、"#3"等后缀直到找到可用名称，记录WARN日志提醒用户</li>
+     *         </ul>
+     *       </li>
+     *       <li>如果referenceKey已存在但Bean名称不同：注册别名指向已存在的Bean，避免重复创建</li>
+     *     </ul>
+     *   </li>
+     *   <li><b>创建BeanDefinition</b>：
+     *     <ul>
+     *       <li>创建RootBeanDefinition，设置beanClass为ReferenceBean.class</li>
+     *       <li>将注解属性存储到BeanDefinition的attribute中（而非propertyValues），避免提前实例化</li>
+     *       <li>设置decoratedDefinition为接口类型的GenericBeanDefinition，用于Spring AOT处理时的类型推断</li>
+     *       <li>设置OBJECT_TYPE_ATTRIBUTE为接口Class，解决Spring 5.2+的FactoryBean类型推断问题</li>
+     *     </ul>
+     *   </li>
+     *   <li><b>注册到容器</b>：调用beanDefinitionRegistry.registerBeanDefinition将BeanDefinition注册到Spring容器，同时更新referenceBeanManager的索引映射</li>
+     *   <li><b>记录日志</b>：输出INFO日志记录注册的Bean名称、引用键和注入位置，便于调试和问题排查</li>
+     * </ol>
+     * </p>
+     *
+     * @param propertyName 属性名称，取自字段名或setter方法参数名，用作默认的Bean名称
+     * @param injectedType 注入点的类型，即服务接口的Class对象，决定ReferenceBean的泛型类型
+     * @param attributes   注解属性Map，包含@DubboReference的所有配置项（如group、version、timeout、retries等）
+     * @param member       反射成员对象，可以是Field或Method，用于定位注解位置和错误提示
+     * @return 最终确定的ReferenceBean名称，可能与传入的propertyName不同（发生自动重命名时）
+     * @throws BeanCreationException 当接口名缺失、Bean名称冲突且不可重命名、或配置转换失败时抛出创建异常
+     */
     public String registerReferenceBean(
             String propertyName, Class<?> injectedType, Map<String, Object> attributes, Member member)
             throws BeansException {
@@ -426,6 +563,10 @@ public class ReferenceAnnotationBeanPostProcessor extends AbstractAnnotationBean
 
         String checkLocation = "Please check " + member.toString();
 
+        /*
+         * 转换注解属性：
+         * 将@DubboReference的属性转换为ReferenceConfig所需的配置格式，推断接口名
+         */
         // convert annotation props
         ReferenceBeanSupport.convertReferenceProps(attributes, injectedType);
 
@@ -437,10 +578,16 @@ public class ReferenceAnnotationBeanPostProcessor extends AbstractAnnotationBean
                             + checkLocation);
         }
 
-        // check reference key
+        /*
+         * 生成引用键：
+         * 格式为 interface:version@group，用于唯一标识一个Dubbo服务引用
+         */
         String referenceKey = ReferenceBeanSupport.generateReferenceKey(attributes, applicationContext);
 
-        // find reference bean name by reference key
+        /*
+         * 查找已注册的相同配置的Bean：
+         * 如果已有相同referenceKey的Bean，直接复用或注册别名
+         */
         List<String> registeredReferenceBeanNames = referenceBeanManager.getBeanNamesByKey(referenceKey);
         if (registeredReferenceBeanNames.size() > 0) {
             // found same name and reference key
@@ -449,7 +596,10 @@ public class ReferenceAnnotationBeanPostProcessor extends AbstractAnnotationBean
             }
         }
 
-        // check bean definition
+        /*
+         * 检查Bean名称冲突：
+         * 如果当前名称已被占用，需要判断是重用、重命名还是报错
+         */
         boolean isContains;
         if ((isContains = beanDefinitionRegistry.containsBeanDefinition(referenceBeanName))
                 || beanDefinitionRegistry.isAlias(referenceBeanName)) {
@@ -476,6 +626,10 @@ public class ReferenceAnnotationBeanPostProcessor extends AbstractAnnotationBean
                 String prevReferenceKey =
                         ReferenceBeanSupport.generateReferenceKey(prevBeanDefinition, applicationContext);
                 if (StringUtils.isEquals(prevReferenceKey, referenceKey)) {
+                    /*
+                     * 相同配置的Bean已存在：
+                     * 直接返回现有Bean名称，避免重复注册
+                     */
                     // found matched dubbo reference bean, ignore register
                     return referenceBeanName;
                 }
@@ -484,6 +638,10 @@ public class ReferenceAnnotationBeanPostProcessor extends AbstractAnnotationBean
                 prevBeanDesc = referenceBeanName + "[" + prevReferenceKey + "]";
             }
 
+            /*
+             * 处理名称冲突：
+             * 如果不可重命名则抛异常，否则自动生成带后缀的新名称
+             */
             // bean name from attribute 'id' or java-config bean, cannot be renamed
             if (!renameable) {
                 throw new BeanCreationException(
@@ -523,7 +681,10 @@ public class ReferenceAnnotationBeanPostProcessor extends AbstractAnnotationBean
         }
         attributes.put(ReferenceAttributes.ID, referenceBeanName);
 
-        // If registered matched reference before, just register alias
+        /*
+         * 注册别名：
+         * 如果已有相同配置的Bean，仅注册别名指向现有Bean，避免重复创建
+         */
         if (registeredReferenceBeanNames.size() > 0) {
             beanDefinitionRegistry.registerAlias(registeredReferenceBeanNames.get(0), referenceBeanName);
             referenceBeanManager.registerReferenceKeyAndBeanName(referenceKey, referenceBeanName);
@@ -532,9 +693,10 @@ public class ReferenceAnnotationBeanPostProcessor extends AbstractAnnotationBean
 
         Class interfaceClass = injectedType;
 
-        // TODO Only register one reference bean for same (group, interface, version)
-
-        // Register the reference bean definition to the beanFactory
+        /*
+         * 创建BeanDefinition：
+         * 设置ReferenceBean的类型、属性和装饰定义，准备注册到Spring容器
+         */
         RootBeanDefinition beanDefinition = new RootBeanDefinition();
         beanDefinition.setBeanClassName(ReferenceBean.class.getName());
         beanDefinition.getPropertyValues().add(ReferenceAttributes.ID, referenceBeanName);
@@ -550,9 +712,10 @@ public class ReferenceAnnotationBeanPostProcessor extends AbstractAnnotationBean
         if (AotWithSpringDetector.isAotProcessing()) {
             beanDefinition.getPropertyValues().add("referencePropsJson", JsonUtils.toJson(attributes));
         }
-        // create decorated definition for reference bean, Avoid being instantiated when getting the beanType of
-        // ReferenceBean
-        // see org.springframework.beans.factory.support.AbstractBeanFactory#getTypeForFactoryBean()
+        /*
+         * 设置装饰定义：
+         * 用于Spring AOT处理时的类型推断，避免获取ReferenceBean类型时提前实例化
+         */
         GenericBeanDefinition targetDefinition = new GenericBeanDefinition();
         targetDefinition.setBeanClass(interfaceClass);
         beanDefinition.setDecoratedDefinition(

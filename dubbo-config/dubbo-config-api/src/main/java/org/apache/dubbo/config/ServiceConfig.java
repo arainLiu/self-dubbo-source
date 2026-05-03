@@ -408,9 +408,26 @@ public class ServiceConfig<T> extends ServiceConfigBase<T> {
                         TimeUnit.MILLISECONDS);
     }
 
+    /**
+     * 服务导出完成后的回调处理，执行元数据映射和监听器通知。
+     * <p>
+     * 该方法在服务成功导出后被调用，负责完成以下收尾工作：
+     * <ol>
+     *   <li><b>状态标记</b>：设置exported标志为true，标识服务已完成导出</li>
+     *   <li><b>接口名映射</b>：如果启用了SERVICE_NAME_MAPPING功能，异步向元数据中心注册接口名与应用名的映射关系</li>
+     *   <li><b>监听器通知</b>：触发onExported回调，通知所有注册的ServiceListener服务已导出</li>
+     *   <li><b>元数据服务导出</b>：如果配置了注册中心，则导出MetadataService用于服务元数据的查询和管理</li>
+     * </ol>
+     * </p>
+     */
     protected void exported() {
         exported = true;
         List<URL> exportedURLs = this.getExportedUrls();
+        /*
+         * 接口名与应用名映射：
+         * 对于需要服务名称映射的URL，向元数据中心注册接口级别的服务发现映射关系
+         * 这是Dubbo3应用级服务发现的核心机制，支持通过接口名查找应用实例
+         */
         exportedURLs.forEach(url -> {
             if (url.getParameter(SERVICE_NAME_MAPPING_KEY, false)) {
                 ServiceNameMapping serviceNameMapping = ServiceNameMapping.getDefaultExtension(getScopeModel());
@@ -422,8 +439,16 @@ public class ServiceConfig<T> extends ServiceConfigBase<T> {
             }
         });
 
+        /*
+         * 触发导出事件通知：
+         * 调用所有通过addServiceListener注册的监听器，用于扩展点逻辑
+         */
         onExported();
 
+        /*
+         * 导出元数据服务：
+         * 当配置了注册中心时，导出MetadataService以提供元数据查询能力（如服务列表、接口定义等）
+         */
         if (hasRegistrySpecified()) {
             getScopeModel().getDeployer().getApplicationDeployer().exportMetadataService();
         }
@@ -437,8 +462,32 @@ public class ServiceConfig<T> extends ServiceConfigBase<T> {
                         .getRegistries());
     }
 
+    /**
+     * 注册接口名与应用名的映射关系到元数据中心，支持应用级服务发现。
+     * <p>
+     * 该方法是Dubbo3应用级服务发现的关键实现，负责将服务接口标识映射到应用实例，
+     * 使得消费者可以通过接口名查找到对应的提供者应用。支持失败重试机制。
+     * </p>
+     * <p>
+     * 处理流程：
+     * <ol>
+     *   <li><b>状态校验</b>：检查服务是否已导出，如果未导出则直接返回，避免无效注册</li>
+     *   <li><b>执行映射</b>：调用ServiceNameMapping.map将URL中的接口信息写入元数据中心（如Zookeeper、Nacos）</li>
+     *   <li><b>结果记录</b>：根据成功或失败分别记录INFO或ERROR日志，便于问题排查</li>
+     *   <li><b>失败重试</b>：如果映射失败且元数据中心可用，通过定时任务进行异步重试（默认间隔5秒）</li>
+     * </ol>
+     * </p>
+     *
+     * @param url                  服务的URL地址，包含接口名、版本、分组等用于映射的关键信息
+     * @param serviceNameMapping   服务名称映射器，负责与元数据中心交互存储映射关系
+     * @param scheduledExecutor    定时任务执行器，用于失败时的异步重试调度
+     */
     protected void mapServiceName(
             URL url, ServiceNameMapping serviceNameMapping, ScheduledExecutorService scheduledExecutor) {
+        /*
+         * 幂等性保护：
+         * 如果服务已被取消导出（unexported），则终止映射操作
+         */
         if (!exported) {
             return;
         }
@@ -446,12 +495,20 @@ public class ServiceConfig<T> extends ServiceConfigBase<T> {
                 + url.getServiceKey());
         boolean succeeded = false;
         try {
+            /*
+             * 执行映射注册：
+             * 向元数据中心写入 {interface:version:group -> appName} 的映射关系
+             */
             succeeded = serviceNameMapping.map(url);
             if (succeeded) {
                 logger.info(
                         "[INSTANCE_REGISTER][METADATA_REGISTER] Successfully registered interface application mapping for service "
                                 + url.getServiceKey());
             } else {
+                /*
+                 * 映射返回false：
+                 * 通常表示元数据中心连接异常或写入失败
+                 */
                 logger.error(
                         CONFIG_SERVER_DISCONNECTED,
                         "configuration server disconnected",
@@ -460,6 +517,10 @@ public class ServiceConfig<T> extends ServiceConfigBase<T> {
                                 + url.getServiceKey());
             }
         } catch (Exception e) {
+            /*
+             * 映射抛出异常：
+             * 记录详细的异常堆栈，用于故障诊断
+             */
             logger.error(
                     CONFIG_SERVER_DISCONNECTED,
                     "configuration server disconnected",
@@ -468,6 +529,10 @@ public class ServiceConfig<T> extends ServiceConfigBase<T> {
                             + url.getServiceKey(),
                     e);
         }
+        /*
+         * 失败重试调度：
+         * 当映射失败且元数据中心配置有效时，启动定时重试任务
+         */
         if (!succeeded && serviceNameMapping.hasValidMetadataCenter()) {
             scheduleToMapping(scheduledExecutor, serviceNameMapping, url);
         }

@@ -86,24 +86,49 @@ public class DubboInvoker<T> extends AbstractInvoker<T> {
         this.serverShutdownTimeout = ConfigurationUtils.getServerShutdownTimeout(getUrl().getScopeModel());
     }
 
+    /**
+     * 执行Dubbo协议的RPC调用，处理单向和双向通信模式。
+     * <p>
+     * 该方法的处理流程：
+     * 1. 设置调用的基本附件信息（服务路径、版本号）；
+     * 2. 从客户端列表中选择ExchangeClient（单客户端直接使用，多客户端通过轮询负载均衡）；
+     * 3. 计算超时时间并检查是否已超时，超时时直接返回异常结果；
+     * 4. 创建Request对象并设置数据内容和payload限制；
+     * 5. 根据是否为单向调用分别处理：
+     *    - 单向调用：直接发送请求不等待响应；
+     *    - 双向调用：发送请求并等待异步响应，封装为AsyncRpcResult；
+     * 6. 捕获并转换异常类型（超时、网络、序列化等）。
+     * </p>
+     *
+     * @param invocation RPC调用信息，包含方法名、参数类型、参数值等
+     * @return Result 调用结果，可能是单向的默认结果或双向的异步结果
+     * @throws Throwable 当远程调用失败、超时或发生网络异常时抛出
+     */
     @Override
     protected Result doInvoke(final Invocation invocation) throws Throwable {
         RpcInvocation inv = (RpcInvocation) invocation;
         final String methodName = RpcUtils.getMethodName(invocation);
+        // 设置调用的基本附件信息：服务路径和版本号，供服务端识别和路由
         inv.setAttachment(PATH_KEY, getUrl().getPath());
         inv.setAttachment(VERSION_KEY, version);
 
         ExchangeClient currentClient;
         List<? extends ExchangeClient> exchangeClients = clientsProvider.getClients();
+        // 选择ExchangeClient：单客户端直接使用，多客户端通过原子计数器实现轮询负载均衡
         if (exchangeClients.size() == 1) {
             currentClient = exchangeClients.get(0);
         } else {
             currentClient = exchangeClients.get(index.getAndIncrement() % exchangeClients.size());
         }
+
+        // 设置本地地址到RpcContext，供业务逻辑获取当前使用的网络连接信息
         RpcContext.getServiceContext().setLocalAddress(currentClient.getLocalAddress());
+
         try {
+            // 判断是否为单向调用（不需要返回结果的方法）
             boolean isOneway = RpcUtils.isOneway(getUrl(), invocation);
 
+            // 计算本次调用的超时时间，如果超时时间<=0说明已无剩余时间，直接返回超时异常
             int timeout = RpcUtils.calculateTimeout(getUrl(), invocation, methodName, DEFAULT_TIMEOUT);
             if (timeout <= 0) {
                 return AsyncRpcResult.newDefaultAsyncResult(
@@ -114,10 +139,13 @@ public class DubboInvoker<T> extends AbstractInvoker<T> {
                         invocation);
             }
 
+            // 将超时时间设置到invocation附件中，供后续环节使用
             invocation.setAttachment(TIMEOUT_KEY, String.valueOf(timeout));
 
+            // 获取payload限制参数，用于控制序列化后的数据大小
             Integer payload = getUrl().getParameter(PAYLOAD, Integer.class);
 
+            // 创建Request对象并设置必要属性：payload限制、调用数据、协议版本
             Request request = new Request();
             if (payload != null) {
                 request.setPayload(payload);
@@ -125,36 +153,49 @@ public class DubboInvoker<T> extends AbstractInvoker<T> {
             request.setData(inv);
             request.setVersion(Version.getProtocolVersion());
 
+            // 根据是否为单向调用采取不同的处理策略
             if (isOneway) {
+                // 单向调用：获取sent标识（是否需要确认发送成功），设置为false表示不需要响应
                 boolean isSent = getUrl().getMethodParameter(methodName, Constants.SENT_KEY, false);
                 request.setTwoWay(false);
                 currentClient.send(request, isSent);
+                // 返回默认的异步结果（空结果），因为是单向调用无需等待响应
                 return AsyncRpcResult.newDefaultAsyncResult(invocation);
             } else {
+                // 双向调用：设置为true表示需要返回响应结果
                 request.setTwoWay(true);
+                // 获取回调执行器，用于处理响应到达后的异步回调逻辑
                 ExecutorService executor = getCallbackExecutor(getUrl(), inv);
+                // 发送请求并获取异步响应Future，转换为AppResponse类型
                 CompletableFuture<AppResponse> appResponseFuture =
                         currentClient.request(request, timeout, executor).thenApply(AppResponse.class::cast);
-                // save for 2.6.x compatibility, for example, TraceFilter in Zipkin uses com.alibaba.xxx.FutureAdapter
+
+                // 为了2.6.x版本的兼容性而设置Future上下文（如Zipkin的TraceFilter使用FutureAdapter）
                 if (setFutureWhenSync || ((RpcInvocation) invocation).getInvokeMode() != InvokeMode.SYNC) {
                     FutureContext.getContext().setCompatibleFuture(appResponseFuture);
                 }
+
+                // 封装为AsyncRpcResult并设置执行器，返回异步调用结果
                 AsyncRpcResult result = new AsyncRpcResult(appResponseFuture, inv);
                 result.setExecutor(executor);
                 return result;
             }
         } catch (TimeoutException e) {
+            // 超时异常：转换为RpcException并附加详细的调用信息
             throw new RpcException(
                     RpcException.TIMEOUT_EXCEPTION,
                     "Invoke remote method timeout. method: " + RpcUtils.getMethodName(invocation) + ", provider: "
                             + getUrl() + ", cause: " + e.getMessage(),
                     e);
         } catch (RemotingException e) {
+            // 远程调用异常：根据根本原因转换为不同类型的RpcException
             String remoteExpMsg = "Failed to invoke remote method: " + RpcUtils.getMethodName(invocation)
                     + ", provider: " + getUrl() + ", cause: " + e.getMessage();
             if (e.getCause() instanceof IOException && e.getCause().getCause() instanceof SerializationException) {
+                // 序列化异常：单独分类以便排查数据类型不匹配问题
                 throw new RpcException(RpcException.SERIALIZATION_EXCEPTION, remoteExpMsg, e);
             } else {
+                // 网络异常：包括连接断开、超时等底层通信问题
                 throw new RpcException(RpcException.NETWORK_EXCEPTION, remoteExpMsg, e);
             }
         }

@@ -110,6 +110,30 @@ public class SimpleReferenceCache implements ReferenceCache {
                 CACHE_HOLDER, name, k -> new SimpleReferenceCache(k, keyGenerator));
     }
 
+    /**
+     * 获取或创建远程服务的本地代理对象，通过缓存机制避免重复创建ReferenceConfig。
+     * <p>
+     * 该方法是Dubbo服务消费者引用缓存的核心入口，负责根据ReferenceConfig生成唯一的缓存键，
+     * 检查是否已存在相同服务的代理对象，如果存在则直接返回，否则创建新的Invoker代理并缓存。
+     * ReferenceConfig是重量级对象（包含网络连接、线程池等资源），通过缓存可以显著降低资源消耗。
+     * </p>
+     * <p>
+     * 处理流程：
+     * <ol>
+     *   <li><b>生成缓存键</b>：通过KeyGenerator从ReferenceConfig提取接口名、分组、版本号组成唯一键（格式：group/interface:version）</li>
+     *   <li><b>单例检查</b>：判断ReferenceConfig是否为单例模式（默认true），非单例模式下使用缓存可能导致内存泄漏</li>
+     *   <li><b>缓存查找</b>：如果是单例模式，调用get(key, type)从referenceKeyMap中查找已存在的代理对象</li>
+     *   <li><b>索引维护</b>：将ReferenceConfig同时加入referenceTypeMap（按接口类型索引）和referenceKeyMap（按服务键索引）</li>
+     *   <li><b>创建代理</b>：调用rc.get(check)创建新的Invoker代理对象，建立与提供者的网络连接</li>
+     *   <li><b>返回代理</b>：返回创建的代理对象，调用方可以像调用本地方法一样调用远程服务</li>
+     * </ol>
+     * </p>
+     *
+     * @param rc    引用配置对象，包含服务接口、注册地址、超时时间等所有RPC调用所需的配置信息
+     * @param check 是否进行严格检查，true时在连接失败或提供者不可用时抛出异常，false时仅记录警告
+     * @return 远程服务的本地代理对象，类型为服务接口
+     * @throws IllegalStateException 当配置错误或注册中心连接失败时可能抛出（取决于check参数）
+     */
     @Override
     @SuppressWarnings("unchecked")
     public <T> T get(ReferenceConfigBase<T> rc, boolean check) {
@@ -118,10 +142,18 @@ public class SimpleReferenceCache implements ReferenceCache {
 
         boolean singleton = rc.getSingleton() == null || rc.getSingleton();
         T proxy = null;
+        /*
+         * 单例模式缓存查找：
+         * 对于单例ReferenceConfig，先尝试从缓存中获取已存在的代理对象，避免重复创建
+         */
         // Check existing proxy of the same 'key' and 'type' first.
         if (singleton) {
             proxy = get(key, (Class<T>) type);
         } else {
+            /*
+             * 非单例模式警告：
+             * 非单例ReferenceConfig与缓存机制同时使用会导致内存泄漏，建议直接调用ReferenceConfig#get()
+             */
             logger.warn(
                     CONFIG_API_WRONG_USE,
                     "",
@@ -130,13 +162,29 @@ public class SimpleReferenceCache implements ReferenceCache {
                             + "Call ReferenceConfig#get() directly for non-singleton ReferenceConfig instead of using ReferenceCache#get(ReferenceConfig)");
         }
 
+        /*
+         * 创建新代理：
+         * 当缓存中不存在时，初始化ReferenceConfig并创建Invoker代理对象
+         */
         if (proxy == null) {
+            /*
+             * 维护类型索引：
+             * 将ReferenceConfig按接口类型分组存储，便于后续通过getAll(type)批量查询
+             */
             List<ReferenceConfigBase<?>> referencesOfType = ConcurrentHashMapUtils.computeIfAbsent(
                     referenceTypeMap, type, _t -> Collections.synchronizedList(new ArrayList<>()));
             referencesOfType.add(rc);
+            /*
+             * 维护键索引：
+             * 将ReferenceConfig按服务键分组存储，便于后续通过get(key)快速查找
+             */
             List<ReferenceConfigBase<?>> referenceConfigList = ConcurrentHashMapUtils.computeIfAbsent(
                     referenceKeyMap, key, _k -> Collections.synchronizedList(new ArrayList<>()));
             referenceConfigList.add(rc);
+            /*
+             * 执行引用创建：
+             * 调用ReferenceConfig.get创建Invoker代理，建立与提供者的网络连接
+             */
             proxy = rc.get(check);
         }
 

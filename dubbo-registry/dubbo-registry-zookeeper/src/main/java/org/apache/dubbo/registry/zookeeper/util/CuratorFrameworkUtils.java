@@ -150,6 +150,28 @@ public abstract class CuratorFrameworkUtils {
         return serviceInstance;
     }
 
+    /**
+     * 将Dubbo的服务实例转换为Curator框架的ServiceInstance格式，用于Zookeeper注册。
+     * <p>
+     * 该方法是Dubbo与Zookeeper集成的关键适配层，负责将Dubbo内部的ServiceInstance对象
+     * 包装为Curator Discovery库所需的ServiceInstance<ZookeeperInstance>格式，
+     * 以便能够通过Curator框架将服务实例信息写入Zookeeper。
+     * </p>
+     * <p>
+     * 转换内容：
+     * <ul>
+     *   <li><b>服务标识</b>：使用host:port组合作为唯一ID，确保同一主机不同端口的实例区分</li>
+     *   <li><b>服务名称</b>：取自serviceInstance.getServiceName()，通常是应用名</li>
+     *   <li><b>网络地址</b>：提取主机地址和端口号，用于服务发现时的路由</li>
+     *   <li><b>元数据</b>：携带排序后的元数据Map（包含Revision、服务列表等），存储在ZookeeperInstance中</li>
+     *   <li><b>负载载体</b>：将ZookeeperInstance作为payload附加到Curator ServiceInstance中</li>
+     * </ul>
+     * </p>
+     *
+     * @param serviceInstance Dubbo服务实例对象，包含应用名、主机、端口、元数据等信息
+     * @return Curator框架的ServiceInstance对象，泛型类型为ZookeeperInstance
+     * @throws RuntimeException 当构建ServiceInstance失败时（如参数不合法）抛出运行时异常
+     */
     public static org.apache.curator.x.discovery.ServiceInstance<ZookeeperInstance> build(
             ServiceInstance serviceInstance) {
         ServiceInstanceBuilder builder;
@@ -157,9 +179,21 @@ public abstract class CuratorFrameworkUtils {
         String host = serviceInstance.getHost();
         int port = serviceInstance.getPort();
         Map<String, String> metadata = serviceInstance.getSortedMetadata();
+        /*
+         * 生成唯一实例ID：
+         * 格式为 {host}:{port}，用于在Zookeeper中唯一标识一个服务实例
+         */
         String id = generateId(host, port);
+        /*
+         * 创建ZookeeperInstance包装对象：
+         * 将ID、服务名、元数据封装在一起，作为Curator ServiceInstance的payload
+         */
         ZookeeperInstance zookeeperInstance = new ZookeeperInstance(id, serviceName, metadata);
         try {
+            /*
+             * 构建Curator ServiceInstance：
+             * 设置ID、名称、地址、端口和负载载体，准备写入Zookeeper
+             */
             builder =
                     builder().id(id).name(serviceName).address(host).port(port).payload(zookeeperInstance);
         } catch (Exception e) {

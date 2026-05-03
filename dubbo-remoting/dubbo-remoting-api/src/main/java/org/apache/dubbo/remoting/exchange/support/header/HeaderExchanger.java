@@ -43,17 +43,36 @@ public class HeaderExchanger implements Exchanger {
                 Transporters.connect(url, new DecodeHandler(new HeaderExchangeHandler(handler))), true);
     }
 
+    /**
+     * 创建HeaderExchangeServer，包装底层Transport层并添加请求-响应交换能力。
+     * <p>
+     * 该方法根据URL配置选择两种不同的服务器绑定策略：
+     * 1. 端口统一服务器（PortUnification）：支持多种协议的自动识别和切换；
+     * 2. 标准Transport服务器：直接使用Transporter实现进行绑定。
+     * 两种策略都会通过DecodeHandler和HeaderExchangeHandler构建完整的消息处理链。
+     * </p>
+     *
+     * @param url 服务器配置的URL对象，包含地址、端口、协议类型等信息
+     * @param handler 交换层处理器，负责处理具体的RPC请求和响应逻辑
+     * @return HeaderExchangeServer对象，提供双向通信能力的网络服务器
+     * @throws RemotingException 当服务器启动失败（如端口占用、协议不支持等）时抛出
+     */
     @Override
     public ExchangeServer bind(URL url, ExchangeHandler handler) throws RemotingException {
         ExchangeServer server;
+        // 判断是否启用端口统一服务器模式（支持多协议共存和动态切换）
         boolean isPuServerKey = url.getParameter(IS_PU_SERVER_KEY, false);
         if (isPuServerKey) {
+            // 使用PortUnificationExchanger绑定服务器，支持运行时协议检测和升级
             server = new HeaderExchangeServer(
                     PortUnificationExchanger.bind(url, new DecodeHandler(new HeaderExchangeHandler(handler))));
         } else {
+            // 使用标准Transporters绑定服务器，适用于单一协议场景
+            //这里 创建服务 同时对requestHandler进行了包装ExchangeHandlerAdapter ->  HeaderExchangeHandler ->DecodeHandler
             server = new HeaderExchangeServer(
                     Transporters.bind(url, new DecodeHandler(new HeaderExchangeHandler(handler))));
         }
         return server;
     }
+
 }

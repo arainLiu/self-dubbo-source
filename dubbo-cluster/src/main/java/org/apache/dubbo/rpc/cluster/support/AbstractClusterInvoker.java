@@ -137,37 +137,52 @@ public abstract class AbstractClusterInvoker<T> implements ClusterInvoker<T> {
     }
 
     /**
-     * Select a invoker using loadbalance policy.</br>
-     * a) Firstly, select an invoker using loadbalance. If this invoker is in previously selected list, or,
-     * if this invoker is unavailable, then continue step b (reselect), otherwise return the first selected invoker</br>
+     * 使用负载均衡策略选择一个Invoker进行RPC调用。
      * <p>
-     * b) Reselection, the validation rule for reselection: selected > available. This rule guarantees that
-     * the selected invoker has the minimum chance to be one in the previously selected list, and also
-     * guarantees this invoker is available.
+     * 该方法的处理逻辑：
+     * 1. 检查Invoker列表是否为空，为空则直接返回null；
+     * 2. 获取方法级别的sticky（粘滞）配置，判断是否启用粘滞连接；
+     * 3. 如果启用了sticky且之前的stickyInvoker仍然有效（在候选列表中、未被选中过、可用），则直接返回该Invoker；
+     * 4. 否则调用doSelect方法执行具体的负载均衡选择逻辑；
+     * 5. 如果启用了sticky，将本次选择的Invoker保存为下次的stickyInvoker。
+     * </p>
+     * <p>
+     * 粘滞连接特性：
+     * - 优先复用上次选择的Invoker，减少连接切换开销；
+     * - 当stickyInvoker不可用或在排除列表中时，会重新选择；
+     * - doSelect方法负责处理重试和排除已选中的Invoker。
+     * </p>
      *
-     * @param loadbalance load balance policy
-     * @param invocation  invocation
-     * @param invokers    invoker candidates
-     * @param selected    exclude selected invokers or not
-     * @return the invoker which will final to do invoke.
-     * @throws RpcException exception
+     * @param loadbalance 负载均衡策略，用于从多个Invoker中选择一个（如Random、RoundRobin等）
+     * @param invocation RPC调用信息，包含方法名、参数等，用于获取方法级配置
+     * @param invokers 候选的Invoker列表，所有可用的服务提供者
+     * @param selected 已经选择过的Invoker列表，用于排除避免重复调用同一个提供者
+     * @return Invoker<T> 最终选择的Invoker，如果列表为空则返回null
+     * @throws RpcException 当负载均衡选择失败或发生异常时抛出
      */
     protected Invoker<T> select(
             LoadBalance loadbalance, Invocation invocation, List<Invoker<T>> invokers, List<Invoker<T>> selected)
             throws RpcException {
 
+        // 如果候选Invoker列表为空，直接返回null
         if (CollectionUtils.isEmpty(invokers)) {
             return null;
         }
+
+        // 获取调用方法名，用于查询方法级别的配置参数
         String methodName = invocation == null ? StringUtils.EMPTY_STRING : RpcUtils.getMethodName(invocation);
 
+        // 从URL中获取方法的sticky（粘滞）配置，默认不启用粘滞连接
         boolean sticky =
                 invokers.get(0).getUrl().getMethodParameter(methodName, CLUSTER_STICKY_KEY, DEFAULT_CLUSTER_STICKY);
 
+        // 如果当前的stickyInvoker不在候选列表中（可能已下线或被移除），清空引用
         // ignore overloaded method
         if (stickyInvoker != null && !invokers.contains(stickyInvoker)) {
             stickyInvoker = null;
         }
+
+        // 如果启用了sticky且stickyInvoker有效（未在排除列表中且可用），直接返回以避免不必要的切换
         // ignore concurrency problem
         if (sticky && stickyInvoker != null && (selected == null || !selected.contains(stickyInvoker))) {
             if (availableCheck && stickyInvoker.isAvailable()) {
@@ -175,8 +190,10 @@ public abstract class AbstractClusterInvoker<T> implements ClusterInvoker<T> {
             }
         }
 
+        // 调用子类的具体实现，执行负载均衡选择逻辑（包含重试和排除已选中的Invoker）
         Invoker<T> invoker = doSelect(loadbalance, invocation, invokers, selected);
 
+        // 如果启用了sticky，更新stickyInvoker为本次选择的结果，供下次调用优先使用
         if (sticky) {
             stickyInvoker = invoker;
         }
@@ -184,37 +201,65 @@ public abstract class AbstractClusterInvoker<T> implements ClusterInvoker<T> {
         return invoker;
     }
 
+    /**
+     * 执行负载均衡选择Invoker，处理已选中排除和不可用Invoker的重试逻辑。
+     * <p>
+     * 该方法的处理流程：
+     * 1. 边界条件处理：空列表返回null，单元素列表直接返回（需验证可用性）；
+     * 2. 调用LoadBalance选择一个Invoker；
+     * 3. 检查选中的Invoker是否在排除列表中或不可用；
+     * 4. 如果需要排除，调用reselect重新选择一个可用的Invoker；
+     * 5. 如果reselect失败，使用顺序轮转策略（当前索引+1）作为兜底方案；
+     * 6. 捕获异常并记录日志，提供availablecheck配置的诊断建议。
+     * </p>
+     *
+     * @param loadbalance 负载均衡策略，用于从多个Invoker中选择一个
+     * @param invocation RPC调用信息，包含方法名、参数等
+     * @param invokers 候选的Invoker列表
+     * @param selected 已经选择过的Invoker列表，需要排除避免重复调用
+     * @return Invoker<T> 最终选择的Invoker实例
+     * @throws RpcException 当负载均衡选择失败或发生异常时抛出
+     */
     private Invoker<T> doSelect(
             LoadBalance loadbalance, Invocation invocation, List<Invoker<T>> invokers, List<Invoker<T>> selected)
             throws RpcException {
 
+        // 如果候选Invoker列表为空，直接返回null
         if (CollectionUtils.isEmpty(invokers)) {
             return null;
         }
+
+        // 如果只有一个Invoker，验证其有效性后直接返回
         if (invokers.size() == 1) {
             Invoker<T> tInvoker = invokers.get(0);
             checkShouldInvalidateInvoker(tInvoker);
             return tInvoker;
         }
+
+        // 通过负载均衡器选择一个Invoker
         Invoker<T> invoker = loadbalance.select(invokers, getUrl(), invocation);
 
-        // If the `invoker` is in the  `selected` or invoker is unavailable && availablecheck is true, reselect.
+        // 判断选中的Invoker是否需要排除：已在selected列表中或不可用且启用了可用性检查
         boolean isSelected = selected != null && selected.contains(invoker);
         boolean isUnavailable = availableCheck && !invoker.isAvailable() && getUrl() != null;
 
+        // 如果Invoker不可用，将其标记为无效并从缓存中移除
         if (isUnavailable) {
             invalidateInvoker(invoker);
         }
+
+        // 如果Invoker已被选中过或不可用，执行重新选择逻辑
         if (isSelected || isUnavailable) {
             try {
+                // 重新选择一个不在排除列表中且可用的Invoker
                 Invoker<T> rInvoker = reselect(loadbalance, invocation, invokers, selected, availableCheck);
                 if (rInvoker != null) {
                     invoker = rInvoker;
                 } else {
-                    // Check the index of current selected invoker, if it's not the last one, choose the one at index+1.
+                    // 如果reselect无法找到合适的Invoker，使用顺序轮转策略选择下一个Invoker作为兜底
                     int index = invokers.indexOf(invoker);
                     try {
-                        // Avoid collision
+                        // 通过取模运算实现环形轮转，避免数组越界
                         invoker = invokers.get((index + 1) % invokers.size());
                     } catch (Exception e) {
                         logger.warn(
@@ -226,6 +271,7 @@ public abstract class AbstractClusterInvoker<T> implements ClusterInvoker<T> {
                     }
                 }
             } catch (Throwable t) {
+                // 重新选择失败时记录错误日志，并提供配置建议（可设置availablecheck=false禁用可用性检查）
                 logger.error(
                         CLUSTER_FAILED_RESELECT_INVOKERS,
                         "failed to reselect invokers",
@@ -238,6 +284,7 @@ public abstract class AbstractClusterInvoker<T> implements ClusterInvoker<T> {
 
         return invoker;
     }
+
 
     /**
      * Reselect, use invokers not in `selected` first, if all invokers are in `selected`,
@@ -341,30 +388,59 @@ public abstract class AbstractClusterInvoker<T> implements ClusterInvoker<T> {
         }
     }
 
+    /**
+     * 执行RPC调用的统一入口，协调服务发现、负载均衡和集群容错策略。
+     * <p>
+     * 该方法的处理流程：
+     * 1. 检查集群是否已销毁；
+     * 2. 通过Directory获取经过路由过滤的Invoker列表；
+     * 3. 验证Invoker列表的有效性（非空且与调用匹配）；
+     * 4. 初始化负载均衡策略；
+     * 5. 为异步调用附加唯一标识ID；
+     * 6. 调用子类的doInvoke方法执行具体的集群容错逻辑（如Failover、Failfast等）。
+     * </p>
+     * <p>
+     * 该方法还集成了性能剖析工具（InvocationProfilerUtils），用于监控路由和集群调用两个阶段的耗时。
+     * </p>
+     *
+     * @param invocation RPC调用信息，包含方法名、参数类型、参数值等
+     * @return Result 调用结果，可能是同步或异步返回
+     * @throws RpcException 当集群已销毁、无可用提供者或调用失败时抛出异常
+     */
     @Override
     public Result invoke(final Invocation invocation) throws RpcException {
+        // 检查集群是否已被销毁，防止在关闭状态下继续提供服务
         checkWhetherDestroyed();
 
-        // binding attachments into invocation.
+        // 绑定附件到invocation中（当前注释掉的代码用于从RpcContext获取上下文附件并合并到invocation）
         //        Map<String, Object> contextAttachments = RpcContext.getClientAttachment().getObjectAttachments();
         //        if (contextAttachments != null && contextAttachments.size() != 0) {
         //            ((RpcInvocation) invocation).addObjectAttachmentsIfAbsent(contextAttachments);
         //        }
 
+        // 启动路由阶段的性能剖析，记录路由规则匹配的耗时
         InvocationProfilerUtils.enterDetailProfiler(invocation, () -> "Router route.");
+        // 通过Directory获取经过路由过滤后的Invoker列表
         List<Invoker<T>> invokers = list(invocation);
+        // 释放路由阶段的性能剖析
         InvocationProfilerUtils.releaseDetailProfiler(invocation);
 
+        // 验证Invoker列表的有效性，确保有可用的服务提供者
         checkInvokers(invokers, invocation);
 
+        // 初始化负载均衡策略（根据URL配置选择具体的LoadBalance实现，如Random、RoundRobin等）
         LoadBalance loadbalance = initLoadBalance(invokers, invocation);
+        // 如果是异步调用，为invocation附加唯一的调用ID，用于后续的结果关联
         RpcUtils.attachInvocationIdIfAsync(getUrl(), invocation);
 
+        // 启动集群调用阶段的性能剖析，记录具体集群策略（如Failover）的执行耗时
         InvocationProfilerUtils.enterDetailProfiler(
                 invocation, () -> "Cluster " + this.getClass().getName() + " invoke.");
         try {
+            // 调用子类的具体实现，执行集群容错逻辑（由子类决定是故障转移、快速失败还是其他策略）
             return doInvoke(invocation, invokers, loadbalance);
         } finally {
+            // 确保在finally块中释放性能剖析资源，防止内存泄漏
             InvocationProfilerUtils.releaseDetailProfiler(invocation);
         }
     }
@@ -399,19 +475,41 @@ public abstract class AbstractClusterInvoker<T> implements ClusterInvoker<T> {
         }
     }
 
+    /**
+     * 执行单个Invoker的调用，管理RpcContext上下文和性能剖析。
+     * <p>
+     * 该方法的处理流程：
+     * 1. 设置RpcContext上下文（包括服务上下文、远程地址等信息）；
+     * 2. 如果启用了性能剖析，记录Invoker调用的开始时间和目标地址；
+     * 3. 设置invocation中的远程地址信息；
+     * 4. 执行实际的Invoker.invoke调用；
+     * 5. 在finally块中清理RpcContext上下文和释放性能剖析资源。
+     * </p>
+     *
+     * @param invoker 待执行的服务提供者Invoker实例
+     * @param invocation RPC调用信息，包含方法名、参数等
+     * @return Result 调用结果，由具体的Invoker实现返回
+     */
     protected Result invokeWithContext(Invoker<T> invoker, Invocation invocation) {
+        // 设置RpcContext上下文，保存原始的Invoker引用用于后续恢复
         Invoker<T> originInvoker = setContext(invoker);
         Result result;
         try {
+            // 如果启用了简单性能剖析开关，记录Invoker调用的详细信息（包括目标提供者地址）
             if (ProfilerSwitch.isEnableSimpleProfiler()) {
                 InvocationProfilerUtils.enterProfiler(
                         invocation,
                         "Invoker invoke. Target Address: " + invoker.getUrl().getAddress());
             }
+
+            // 设置invocation中的远程地址信息，供后续过滤器和业务逻辑使用
             setRemote(invoker, invocation);
+            // 执行实际的RPC调用，委托给具体的Invoker实现
             result = invoker.invoke(invocation);
         } finally {
+            // 确保在finally块中清理RpcContext上下文，防止内存泄漏和线程复用导致的数据污染
             clearContext(originInvoker);
+            // 释放简单性能剖析资源，停止计时并记录性能数据
             InvocationProfilerUtils.releaseSimpleProfiler(invocation);
         }
         return result;

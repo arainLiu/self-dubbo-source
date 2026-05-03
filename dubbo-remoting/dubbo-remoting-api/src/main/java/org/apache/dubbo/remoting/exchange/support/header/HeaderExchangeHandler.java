@@ -192,35 +192,67 @@ public class HeaderExchangeHandler implements ChannelHandlerDelegate {
         }
     }
 
+    /**
+     * 处理接收到的网络消息，根据消息类型分发到不同的处理逻辑。
+     * <p>
+     * 该方法支持的消息类型和处理策略：
+     * 1. Request（请求）：
+     *    - 事件消息（如心跳、连接事件）：调用handlerEvent处理；
+     *    - 双向请求（需要响应）：调用handleRequest执行业务逻辑并返回响应；
+     *    - 单向请求（不需要响应）：直接调用handler.received处理。
+     * 2. Response（响应）：调用handleResponse处理服务端返回的结果。
+     * 3. String（字符串）：
+     *    - 客户端：不支持字符串消息，记录错误日志；
+     *    - 服务端：作为telnet命令处理，支持运维调试功能。
+     * 4. 其他类型：直接交给下层handler处理。
+     * </p>
+     *
+     * @param channel 网络通道对象，代表与对端的连接
+     * @param message 接收到的消息对象，可能是Request、Response、String或其他类型
+     * @throws RemotingException 当消息处理失败时抛出异常
+     */
     @Override
     public void received(Channel channel, Object message) throws RemotingException {
+        // 从底层Channel获取或创建ExchangeChannel，提供请求-响应模式的高级抽象
         final ExchangeChannel exchangeChannel = HeaderExchangeChannel.getOrAddChannel(channel);
+
+        // 根据消息类型执行不同的处理逻辑
         if (message instanceof Request) {
-            // handle request.
+            // 处理Request请求消息
             Request request = (Request) message;
             if (request.isEvent()) {
+                // 处理事件消息（如心跳检测、连接/断开事件等），不需要业务响应
                 handlerEvent(channel, request);
             } else {
+                // 处理业务请求消息
                 if (request.isTwoWay()) {
+                    // 双向请求：需要执行业务逻辑并返回响应结果给调用方
                     handleRequest(exchangeChannel, request);
                 } else {
+                    // 单向请求：不需要返回响应，直接交给下层处理器处理
                     handler.received(exchangeChannel, request.getData());
                 }
             }
         } else if (message instanceof Response) {
+            // 处理Response响应消息（客户端接收服务端的返回结果）
             handleResponse(channel, (Response) message);
         } else if (message instanceof String) {
+            // 处理字符串消息：主要用于telnet命令行交互
             if (isClientSide(channel)) {
+                // 客户端侧：Dubbo协议不支持接收字符串消息，记录错误日志
                 Exception e = new Exception("Dubbo client can not supported string message: " + message
                         + " in channel: " + channel + ", url: " + channel.getUrl());
                 logger.error(TRANSPORT_UNSUPPORTED_MESSAGE, "", "", e.getMessage(), e);
             } else {
+                // 服务端侧：将字符串作为telnet命令处理，支持运维人员远程调试和管理
                 String echo = handler.telnet(channel, (String) message);
                 if (StringUtils.isNotEmpty(echo)) {
+                    // 如果有输出结果，发送回客户端
                     channel.send(echo);
                 }
             }
         } else {
+            // 处理其他类型的消息，直接委托给下层handler处理
             handler.received(exchangeChannel, message);
         }
     }

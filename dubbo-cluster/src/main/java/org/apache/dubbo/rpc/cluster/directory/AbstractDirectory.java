@@ -200,8 +200,26 @@ public abstract class AbstractDirectory<T> implements Directory<T> {
         setRouterChain(routerChain);
     }
 
+    /**
+     * 获取可用的Invoker列表，经过路由规则过滤后返回符合条件的服务提供者。
+     * <p>
+     * 该方法的处理流程：
+     * 1. 检查目录是否已销毁；
+     * 2. 获取读锁保护invokers集合的读取操作，防止并发修改；
+     * 3. 根据初始化状态克隆有效的Invoker列表（避免在后续路由过程中被修改）；
+     * 4. 如果配置了路由链，执行路由规则过滤得到符合条件的Invoker；
+     * 5. 调用doList方法执行具体的列表获取逻辑（由子类实现）；
+     * 6. 如果结果为空，记录警告日志提示无可用提供者；
+     * 7. 返回不可修改的结果列表。
+     * </p>
+     *
+     * @param invocation RPC调用信息，包含方法名、参数等，用于路由规则判断
+     * @return List<Invoker<T>> 经过路由过滤后的可用Invoker列表
+     * @throws RpcException 当目录已销毁、获取锁超时或路由处理失败时抛出异常
+     */
     @Override
     public List<Invoker<T>> list(Invocation invocation) throws RpcException {
+        // 检查目录是否已被销毁，防止在关闭状态下继续提供服务
         if (destroyed) {
             throw new RpcException(
                     "Directory of type " + this.getClass().getSimpleName() + " already destroyed for service "
@@ -211,11 +229,14 @@ public abstract class AbstractDirectory<T> implements Directory<T> {
         BitList<Invoker<T>> availableInvokers;
         SingleRouterChain<T> singleChain = null;
         try {
+            // 如果配置了路由链，先获取路由链的读锁
             if (routerChain != null) {
                 routerChain.getLock().readLock().lock();
             }
+
             boolean lockAcquired = false;
             try {
+                // 尝试在超时时间内获取invoker刷新锁的读锁，防止在读取过程中invokers被刷新修改
                 if (!invokerRefreshReadLock.tryLock(LockUtils.DEFAULT_TIMEOUT, TimeUnit.MILLISECONDS)) {
                     throw new RpcException(
                             "Failed to acquire read lock on invokerRefreshLock within timeout. " + "Timeout: "
@@ -226,30 +247,39 @@ public abstract class AbstractDirectory<T> implements Directory<T> {
                                     + getConsumerUrl().getServiceKey());
                 }
                 lockAcquired = true;
-                // use clone to avoid being modified at doList().
+
+                // 克隆Invoker列表以避免在doList()执行过程中被修改，根据初始化状态选择克隆源
                 if (invokersInitialized) {
+                    // 已初始化后克隆有效Invoker列表（剔除无效的）
                     availableInvokers = validInvokers.clone();
                 } else {
+                    // 未初始化前克隆全部Invoker列表
                     availableInvokers = invokers.clone();
                 }
             } catch (InterruptedException e) {
+                // 等待锁时被中断，恢复中断标志并抛出异常
                 Thread.currentThread().interrupt();
                 throw new RpcException(
                         "Interrupted while acquiring read lock for invoker access, cause: " + e.getMessage(), e);
             } finally {
+                // 确保在finally块中释放锁，防止死锁
                 if (lockAcquired) {
                     invokerRefreshReadLock.unlock();
                 }
             }
 
+            // 如果配置了路由链，执行路由规则过滤获取单条路由链结果
             if (routerChain != null) {
                 singleChain = routerChain.getSingleChain(getConsumerUrl(), availableInvokers, invocation);
                 singleChain.getLock().readLock().lock();
             }
+
+            // 调用子类的具体实现，执行路由过滤和负载均衡前的最终列表获取
             List<Invoker<T>> routedResult = doList(singleChain, availableInvokers, invocation);
+
+            // 如果路由后结果为空，记录警告日志（可能意味着所有提供者都不可用或被路由规则过滤）
             if (routedResult.isEmpty()) {
                 // 2-2 - No provider available.
-
                 logger.warn(
                         CLUSTER_NO_VALID_PROVIDER,
                         "provider server or registry center crashed",
@@ -261,8 +291,11 @@ public abstract class AbstractDirectory<T> implements Directory<T> {
                                 + " on the consumer " + NetUtils.getLocalHost()
                                 + " using the dubbo version " + Version.getVersion() + ".");
             }
+
+            // 返回不可修改的列表，防止外部修改内部状态
             return Collections.unmodifiableList(routedResult);
         } finally {
+            // 按相反顺序释放所有持有的锁，确保资源清理
             if (singleChain != null) {
                 singleChain.getLock().readLock().unlock();
             }
