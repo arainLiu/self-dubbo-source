@@ -186,7 +186,7 @@ public class NettyServer extends AbstractServer {
     protected NettyServerHandler createNettyServerHandler() {
         //NettyServerHandler -> NettyServer -> MultiMessageHandler
         // ->HeartbeatHandler -> AllChannelHandler -> DecodeHandler
-        // -> HeaderExchangeHandler-> ExchangeHandlerAdapter
+        // -> HeaderExchangeHandler-> ExchangeHandlerAdapter?
         return new NettyServerHandler(getUrl(), this);
     }
 

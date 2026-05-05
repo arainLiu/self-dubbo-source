@@ -91,30 +91,54 @@ public class DefaultExecutorRepository implements ExecutorRepository, ExtensionA
     }
 
     /**
-     * Get called when the server or client instance initiating.
+     * 创建并获取线程池执行器（如果不存在）
+     * <p>
+     * 该方法在服务器或客户端实例初始化时被调用，负责创建和管理线程池执行器。
+     * 主要执行以下操作：
+     * 1. 根据URL生成执行器的键值
+     * 2. 获取或创建对应类型的执行器映射表
+     * 3. 设置线程名称（如果未设置）
+     * 4. 从缓存中获取或创建新的执行器
+     * 5. 检查执行器是否已关闭，如果关闭则重新创建
+     * 6. 将执行器存储到数据仓库中
+     * <p>
+     * 该方法使用同步锁保证线程安全，确保同一配置下只创建一个执行器。
+     * 支持执行器的自动重建机制，当检测到执行器已关闭时会自动创建新的执行器。
      *
-     * @param url
-     * @return
+     * @param url 包含线程池配置参数的URL对象
+     * @return 创建或获取的ExecutorService执行器服务
      */
     @Override
     public synchronized ExecutorService createExecutorIfAbsent(URL url) {
+        // 生成执行器的主键（如server/service等）
         String executorKey = getExecutorKey(url);
+
+        // 获取或创建对应类型的执行器映射表
         ConcurrentMap<String, ExecutorService> executors =
                 ConcurrentHashMapUtils.computeIfAbsent(data, executorKey, k -> new ConcurrentHashMap<>());
 
+        // 生成执行器的二级键（基于协议、IP、端口等）
         String executorCacheKey = getExecutorSecondKey(url);
 
+        // 如果URL中未设置线程名称，则根据executorCacheKey设置
         url = setThreadNameIfAbsent(url, executorCacheKey);
 
         URL finalUrl = url;
+
+        // 从缓存中获取或创建新的执行器
         ExecutorService executor =
-                ConcurrentHashMapUtils.computeIfAbsent(executors, executorCacheKey, k -> createExecutor(finalUrl));
+                ConcurrentHashMapUtils.computeIfAbsent(executors, executorCacheKey
+                        , k -> createExecutor(finalUrl));
+
         // If executor has been shut down, create a new one
+        // 如果执行器已关闭或终止，则移除旧执行器并重新创建
         if (executor.isShutdown() || executor.isTerminated()) {
             executors.remove(executorCacheKey);
             executor = createExecutor(url);
             executors.put(executorCacheKey, executor);
         }
+
+        // 将执行器存储到数据仓库中，便于后续管理
         dataStore.put(executorKey, executorCacheKey, executor);
         return executor;
     }
@@ -187,6 +211,23 @@ public class DefaultExecutorRepository implements ExecutorRepository, ExtensionA
         }
     }
 
+    /**
+     * 创建线程池执行器
+     * <p>
+     * 该方法通过Dubbo SPI机制获取ThreadPool的自适应扩展实现，
+     * 并根据URL配置参数创建对应的线程池执行器。
+     * <p>
+     * 主要流程：
+     * 1. 获取ThreadPool类的扩展加载器
+     * 2. 获取自适应扩展实例（根据URL中的threadpool参数决定具体实现）
+     * 3. 调用getExecutor方法创建线程池
+     * <p>
+     * 支持的线程池类型包括：fixed、cached、limited、eager等，
+     * 具体使用哪种类型由URL中的threadpool参数决定。
+     *
+     * @param url 包含线程池配置参数的URL对象
+     * @return 创建的ExecutorService执行器服务
+     */
     protected ExecutorService createExecutor(URL url) {
         return (ExecutorService) extensionAccessor
                 .getExtensionLoader(ThreadPool.class)

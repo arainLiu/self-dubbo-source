@@ -115,32 +115,54 @@ public class DefaultModuleDeployer extends AbstractDeployer<ModuleModel> impleme
         }
     }
 
+    /**
+     * 初始化ModuleDeployer
+     * <p>
+     * 该方法负责完成Dubbo模块部署器的完整初始化流程，采用双重检查锁定机制确保线程安全。
+     * 主要执行以下初始化步骤：
+     * 1. 检查初始化状态，避免重复初始化
+     * 2. 执行初始化回调（onInitialize）
+     * 3. 加载模块级别的配置信息
+     * 4. 读取ModuleConfig配置，确定异步导出/引用、后台运行等行为
+     * 5. 兼容旧版本的背景运行配置逻辑
+     * <p>
+     * 该方法使用同步锁保证并发场景下的初始化安全性，
+     * 确保只执行一次完整的初始化流程。
+     *
+     * @throws IllegalStateException 当默认模块配置未正确初始化时抛出异常
+     */
     @Override
     public void initialize() throws IllegalStateException {
         if (initialized) {
             return;
         }
-        // Ensure that the initialization is completed when concurrent calls
+
+        // 使用同步锁确保并发调用时初始化只执行一次
         synchronized (this) {
             if (initialized) {
                 return;
             }
+
+            // 执行初始化回调
             onInitialize();
 
+            // 加载模块配置信息
             loadConfigs();
 
-            // read ModuleConfig
+            // read ModuleConfig，读取模块配置并设置行为参数
             ModuleConfig moduleConfig = moduleModel
                     .getConfigManager()
                     .getModule()
                     .orElseThrow(() -> new IllegalStateException("Default module config is not initialized"));
+
+            // 从ModuleConfig中读取是否异步导出服务和异步引用服务
             exportAsync = Boolean.TRUE.equals(moduleConfig.getExportAsync());
             referAsync = Boolean.TRUE.equals(moduleConfig.getReferAsync());
 
-            // start in background
+            // start in background，设置是否在后台运行
             background = moduleConfig.getBackground();
             if (background == null) {
-                // compatible with old usages
+                // compatible with old usages，兼容旧版本的背景运行配置
                 background = isExportBackground() || isReferBackground();
             }
 
@@ -512,14 +534,30 @@ public class DefaultModuleDeployer extends AbstractDeployer<ModuleModel> impleme
         }
     }
 
+        /**
+     * 注册模块中配置的所有服务到注册中心。
+     * <p>
+     * 该方法遍历配置管理器中的所有服务配置（ServiceConfigBase），对于每个未显式禁用注册的服务，
+     * 调用registerServiceInternal()方法执行具体的注册逻辑。注册完成后，刷新应用级别的服务实例信息，
+     * 确保服务元数据和状态保持最新。
+     * </p>
+     * <p>
+     * 注册条件：只有当服务的isRegister()属性不为false时才执行注册，
+     * 允许通过配置register="false"来跳过特定服务的注册。
+     * </p>
+     */
     private void registerServices() {
         for (ServiceConfigBase sc : configManager.getServices()) {
             if (!Boolean.FALSE.equals(sc.isRegister())) {
                 registerServiceInternal(sc);
             }
         }
+        /*
+         * 刷新应用级别的服务实例信息，确保服务元数据同步更新
+         */
         applicationDeployer.refreshServiceInstance();
     }
+
 
     private void checkReferences() {
         Optional<ModuleConfig> module = configManager.getModule();
@@ -605,19 +643,43 @@ public class DefaultModuleDeployer extends AbstractDeployer<ModuleModel> impleme
         }
     }
 
+    /**
+     * 执行单个服务配置的内部注册逻辑，包含状态检查和前置准备。
+     * <p>
+     * 该方法在调用实际注册之前会进行一系列校验，确保服务处于可注册状态：
+     * <ol>
+     *   <li>确保服务配置已刷新，如果未刷新则先调用refresh()方法加载最新配置</li>
+     *   <li>检查服务是否已导出，未导出的服务不能直接注册，直接返回</li>
+     *   <li>检查服务是否配置了延迟注册，如果是则跳过本次注册，等待延迟任务执行</li>
+     *   <li>所有条件满足后，调用serviceConfig.register(true)执行实际的注册操作</li>
+     * </ol>
+     * </p>
+     *
+     * @param sc 服务配置基类对象，会被转换为ServiceConfig执行具体操作
+     */
     private void registerServiceInternal(ServiceConfigBase sc) {
         ServiceConfig<?> serviceConfig = (ServiceConfig<?>) sc;
+        /*
+         * 确保服务配置已刷新，加载最新的配置参数
+         */
         if (!serviceConfig.isRefreshed()) {
             serviceConfig.refresh();
         }
+        /*
+         * 未导出的服务不能注册，直接跳过
+         */
         if (!sc.isExported()) {
             return;
         }
+        /*
+         * 延迟注册的服务由定时任务处理，此处跳过
+         */
         if (sc.shouldDelay()) {
             return;
         }
         sc.register(true);
     }
+
 
     private void unexportServices() {
         exportedServices.forEach(sc -> {

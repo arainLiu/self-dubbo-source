@@ -204,37 +204,61 @@ public class DefaultApplicationDeployer extends AbstractDeployer<ApplicationMode
     }
 
     /**
-     * Initialize
+     * 初始化ApplicationDeployer
+     * <p>
+     * 该方法负责完成Dubbo应用部署器的完整初始化流程，采用双重检查锁定机制确保线程安全。
+     * 主要执行以下初始化步骤：
+     * 1. 检查初始化状态，避免重复初始化
+     * 2. 执行初始化回调（onInitialize）
+     * 3. 注册JVM关闭钩子，优雅停机
+     * 4. 启动配置中心客户端
+     * 5. 加载应用级配置
+     * 6. 初始化模块部署器列表
+     * 7. 初始化指标报告器
+     * 8. 初始化指标服务
+     * 9. 初始化Observation注册表（since 3.2.3）
+     * 10. 启动元数据中心（since 2.7.8）
+     * <p>
+     * 该方法使用同步锁保证并发场景下的初始化安全性，
+     * 确保只执行一次完整的初始化流程。
      */
     @Override
     public void initialize() {
         if (initialized) {
             return;
         }
-        // Ensure that the initialization is completed when concurrent calls
+
+        // 使用同步锁确保并发调用时初始化只执行一次
         synchronized (startLock) {
             if (initialized) {
                 return;
             }
+
+            // 执行初始化回调
             onInitialize();
 
-            // register shutdown hook
+            // register shutdown hook，注册JVM关闭钩子用于优雅停机
             registerShutdownHook();
 
+            // 启动配置中心客户端，拉取远程配置
             startConfigCenter();
 
+            // 加载应用级配置信息
             loadApplicationConfigs();
 
+            // 初始化所有ModuleDeployer
             initModuleDeployers();
 
+            // 初始化指标报告器
             initMetricsReporter();
 
+            // 初始化指标服务
             initMetricsService();
 
-            // @since 3.2.3
+            // @since 3.2.3，初始化Observation注册表用于分布式追踪
             initObservationRegistry();
 
-            // @since 2.7.8
+            // @since 2.7.8，启动元数据中心
             startMetadataCenter();
 
             initialized = true;

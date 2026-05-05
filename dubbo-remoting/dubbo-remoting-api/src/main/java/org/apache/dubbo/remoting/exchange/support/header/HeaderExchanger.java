@@ -68,7 +68,7 @@ public class HeaderExchanger implements Exchanger {
                     PortUnificationExchanger.bind(url, new DecodeHandler(new HeaderExchangeHandler(handler))));
         } else {
             // 使用标准Transporters绑定服务器，适用于单一协议场景
-            //这里 创建服务 同时对requestHandler进行了包装ExchangeHandlerAdapter ->  HeaderExchangeHandler ->DecodeHandler
+            //这里 创建服务 同时对requestHandler进行了包装 ExchangeHandlerAdapter ->  HeaderExchangeHandler ->DecodeHandler
             server = new HeaderExchangeServer(
                     Transporters.bind(url, new DecodeHandler(new HeaderExchangeHandler(handler))));
         }

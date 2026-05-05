@@ -43,23 +43,57 @@ import org.springframework.beans.factory.support.RootBeanDefinition;
  * @see BeanDefinitionRegistryPostProcessor
  * @since 3.3
  */
+
+/**
+ * 支持AOT（Ahead-of-Time）编译的服务注解后置处理器
+ * <p>
+ * 该类继承自{@link ServiceAnnotationPostProcessor}，并实现{@link BeanRegistrationAotProcessor}接口，
+ * 用于在Spring AOT编译阶段为Dubbo服务Bean生成必要的运行时提示（Runtime Hints），
+ * 包括反射访问和序列化支持，以确保Dubbo服务在GraalVM原生镜像中正常工作。
+ *
+ * @see AnnotationBeanDefinitionParser
+ * @see BeanDefinitionRegistryPostProcessor
+ * @since 3.3
+ */
 public class ServiceAnnotationWithAotPostProcessor extends ServiceAnnotationPostProcessor
         implements BeanRegistrationAotProcessor {
 
     private final ErrorTypeAwareLogger logger = LoggerFactory.getErrorTypeAwareLogger(getClass());
 
+    /**
+     * 构造函数，指定要扫描的包路径
+     *
+     * @param packagesToScan 需要扫描的包路径数组
+     */
     public ServiceAnnotationWithAotPostProcessor(String... packagesToScan) {
         super(packagesToScan);
     }
 
+    /**
+     * 构造函数，指定要扫描的包路径集合
+     *
+     * @param packagesToScan 需要扫描的包路径集合
+     */
     public ServiceAnnotationWithAotPostProcessor(Collection<?> packagesToScan) {
         super(packagesToScan);
     }
 
+    /**
+     * 在AOT编译阶段处理Bean注册，为Dubbo服务生成运行时提示
+     * <p>
+     * 该方法会检查Bean类型：
+     * 1. 如果是ServiceBean，则从Bean定义中获取接口名称并创建AOT贡献
+     * 2. 如果是已扫描的服务类，则直接为其创建AOT贡献
+     * 3. 其他情况返回null
+     *
+     * @param registeredBean 已注册的Bean信息
+     * @return AOT贡献对象，用于生成运行时提示；如果不需要AOT处理则返回null
+     */
     @Override
     public BeanRegistrationAotContribution processAheadOfTime(RegisteredBean registeredBean) {
         Class<?> beanClass = registeredBean.getBeanClass();
         if (beanClass.equals(ServiceBean.class)) {
+            // 处理ServiceBean类型，从Bean定义中提取接口信息
             RootBeanDefinition beanDefinition = registeredBean.getMergedBeanDefinition();
             String interfaceName = (String) beanDefinition.getPropertyValues().get("interface");
             try {
@@ -69,27 +103,51 @@ public class ServiceAnnotationWithAotPostProcessor extends ServiceAnnotationPost
                 throw new RuntimeException(e);
             }
         } else if (servicePackagesHolder.isClassScanned(beanClass.getName())) {
+            // 处理已扫描的服务类
             return new DubboServiceBeanRegistrationAotContribution(beanClass);
         }
 
         return null;
     }
 
+    /**
+     * Dubbo服务Bean的AOT贡献实现类
+     * <p>
+     * 负责在AOT编译阶段为服务接口类注册反射访问权限和序列化支持
+     */
     private static class DubboServiceBeanRegistrationAotContribution implements BeanRegistrationAotContribution {
 
         private final Class<?> cl;
 
+        /**
+         * 构造函数
+         *
+         * @param cl 需要注册AOT提示的类
+         */
         public DubboServiceBeanRegistrationAotContribution(Class<?> cl) {
             this.cl = cl;
         }
 
+        /**
+         * 将AOT提示应用到运行时配置中
+         * <p>
+         * 为服务类注册：
+         * 1. 反射访问公共方法的权限
+         * 2. 序列化支持（通过AotUtils）
+         *
+         * @param generationContext AOT生成上下文
+         * @param beanRegistrationCode Bean注册代码生成器
+         */
         @Override
         public void applyTo(GenerationContext generationContext, BeanRegistrationCode beanRegistrationCode) {
+            // 注册反射访问权限，允许调用公共方法
             generationContext
                     .getRuntimeHints()
                     .reflection()
                     .registerType(TypeReference.of(cl), MemberCategory.INVOKE_PUBLIC_METHODS);
+            // 注册序列化支持
             AotUtils.registerSerializationForService(cl, generationContext.getRuntimeHints());
         }
     }
+
 }

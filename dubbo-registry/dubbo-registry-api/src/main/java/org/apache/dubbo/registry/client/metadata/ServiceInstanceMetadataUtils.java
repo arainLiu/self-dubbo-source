@@ -233,11 +233,28 @@ public class ServiceInstanceMetadataUtils {
                         serviceDiscovery.getUrl().getParameter(REGISTRY_KEY));
     }
 
+        /**
+     * 刷新应用元数据和服务实例信息，确保服务发现信息的实时性和准确性。
+     * <p>
+     * 该方法通过获取应用模型中的注册管理器，遍历所有的服务发现组件并触发其更新操作。
+     * 主要用于服务配置变更、实例状态变化等场景，确保注册中心和服务消费者能够获取到最新的
+     * 服务实例元数据和版本信息（revision）。
+     * </p>
+     *
+     * @param applicationModel 应用模型对象，用于获取注册管理器和相关组件
+     */
     public static void refreshMetadataAndInstance(ApplicationModel applicationModel) {
+        /*
+         * 获取注册管理器，管理当前应用的所有注册和服务发现组件
+         */
         RegistryManager registryManager = applicationModel.getBeanFactory().getBean(RegistryManager.class);
         // update service instance revision
+        /*
+         * 遍历所有服务发现组件，触发实例元数据和版本信息的更新
+         */
         registryManager.getServiceDiscoveries().forEach(ServiceDiscovery::update);
     }
+
 
     public static void unregisterMetadataAndInstance(ApplicationModel applicationModel) {
         RegistryManager registryManager = applicationModel.getBeanFactory().getBean(RegistryManager.class);

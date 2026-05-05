@@ -517,6 +517,20 @@ public class UrlUtils {
                 && PROVIDERS_CATEGORY.equals(url.getCategory(PROVIDERS_CATEGORY));
     }
 
+    /**
+     * 判断URL是否为注册中心类型的URL
+     * <p>
+     * 该方法通过检查URL的协议类型来判断是否为注册中心，支持以下三种情况：
+     * 1. 标准注册中心协议（registry）
+     * 2. 服务发现注册中心协议（service-discovery-registry，忽略大小写）
+     * 3. 自定义注册中心协议（以"-registry-protocol"结尾的协议）
+     * <p>
+     * 这种设计使得Dubbo能够兼容多种注册中心实现，包括传统的ZooKeeper、
+     * Nacos等，以及基于服务发现的新一代注册中心。
+     *
+     * @param url 待检查的URL对象
+     * @return 如果是注册中心类型的URL返回true，否则返回false
+     */
     public static boolean isRegistry(URL url) {
         return REGISTRY_PROTOCOL.equals(url.getProtocol())
                 || SERVICE_REGISTRY_PROTOCOL.equalsIgnoreCase(url.getProtocol())

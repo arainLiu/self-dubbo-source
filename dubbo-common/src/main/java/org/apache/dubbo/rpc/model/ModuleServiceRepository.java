@@ -125,16 +125,39 @@ public class ModuleServiceRepository {
         return registerService(interfaceClazz, serviceDescriptor);
     }
 
+    /**
+     * 注册服务描述符到模块服务仓库
+     * <p>
+     * 该方法负责将ServiceDescriptor注册到模块的服务仓库中，采用线程安全的方式管理：
+     * 1. 使用接口类名作为key，在services Map中获取或创建ServiceDescriptor列表
+     * 2. 使用CopyOnWriteArrayList保证并发读写的线程安全性
+     * 3. 通过同步锁检查是否已存在相同接口的ServiceDescriptor
+     * 4. 如果已存在则直接返回已有的描述符，避免重复注册
+     * 5. 如果不存在则将新的描述符添加到列表中
+     * <p>
+     * 该设计确保了同一接口在模块中只会有一个ServiceDescriptor实例，
+     * 支持多线程环境下的安全注册操作。
+     *
+     * @param interfaceClazz 服务接口的Class对象
+     * @param serviceDescriptor 要注册的服务描述符对象
+     * @return 已注册的ServiceDescriptor，如果已存在则返回已有的描述符
+     */
     public ServiceDescriptor registerService(Class<?> interfaceClazz, ServiceDescriptor serviceDescriptor) {
+        // 根据接口类名获取或创建ServiceDescriptor列表
         List<ServiceDescriptor> serviceDescriptors = ConcurrentHashMapUtils.computeIfAbsent(
                 services, interfaceClazz.getName(), k -> new CopyOnWriteArrayList<>());
+
+        // 同步检查并添加ServiceDescriptor，避免重复注册
         synchronized (serviceDescriptors) {
             Optional<ServiceDescriptor> previous = serviceDescriptors.stream()
                     .filter(s -> s.getServiceInterfaceClass().equals(interfaceClazz))
                     .findFirst();
+
             if (previous.isPresent()) {
+                // 如果已存在相同接口的描述符，直接返回
                 return previous.get();
             } else {
+                // 否则添加到列表中并返回
                 serviceDescriptors.add(serviceDescriptor);
                 return serviceDescriptor;
             }
@@ -142,30 +165,42 @@ public class ModuleServiceRepository {
     }
 
     /**
-     * See {@link #registerService(Class)}
+     * 注册服务并建立路径映射关系
      * <p>
-     * we assume:
-     * 1. services with different interfaces are not allowed to have the same path.
-     * 2. services share the same interface but has different group/version can share the same path.
-     * 3. path's default value is the name of the interface.
+     * 该方法在{@link #registerService(Class)}的基础上，额外处理了服务路径与接口名称不一致的情况。
+     * <p>
+     * 设计假设：
+     * 1. 具有不同接口的服务不允许使用相同的路径
+     * 2. 共享同一接口但具有不同group/version的服务可以共享同一路径
+     * 3. 路径的默认值是接口的全限定名
+     * <p>
+     * 当用户自定义path与接口名称不同时，该方法会创建额外的路径映射，
+     * 使得服务可以通过自定义path被访问。
      *
-     * @param path
-     * @param interfaceClass
-     * @return
+     * @param path 服务的路径，可以是自定义路径或接口名称
+     * @param interfaceClass 服务接口的Class对象
+     * @return 已注册的ServiceDescriptor对象
      */
     public ServiceDescriptor registerService(String path, Class<?> interfaceClass) {
+        // 首先注册服务获取ServiceDescriptor
         ServiceDescriptor serviceDescriptor = registerService(interfaceClass);
+
         // if path is different with interface name, add extra path mapping
+        // 如果自定义path与接口名称不同，则添加额外的路径映射
         if (!interfaceClass.getName().equals(path)) {
             List<ServiceDescriptor> serviceDescriptors =
                     ConcurrentHashMapUtils.computeIfAbsent(services, path, _k -> new CopyOnWriteArrayList<>());
+
+            // 同步检查是否存在相同接口的ServiceDescriptor，避免重复添加
             synchronized (serviceDescriptors) {
                 Optional<ServiceDescriptor> previous = serviceDescriptors.stream()
                         .filter(s -> s.getServiceInterfaceClass().equals(serviceDescriptor.getServiceInterfaceClass()))
                         .findFirst();
                 if (previous.isPresent()) {
+                    // 如果已存在相同接口的描述符，直接返回
                     return previous.get();
                 } else {
+                    // 否则添加到路径映射中
                     serviceDescriptors.add(serviceDescriptor);
                     return serviceDescriptor;
                 }

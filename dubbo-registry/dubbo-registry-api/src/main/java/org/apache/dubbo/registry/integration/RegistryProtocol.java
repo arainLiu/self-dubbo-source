@@ -427,19 +427,46 @@ public class RegistryProtocol implements Protocol, ScopeModelAware {
         return serviceConfigurationListener.overrideUrl(providerUrl);
     }
 
+    /**
+     * 执行本地服务导出
+     * <p>
+     * 该方法负责将Dubbo服务导出到本地Exporter管理器中，主要执行以下操作：
+     * 1. 从originInvoker中提取providerUrl和registryUrl的键值
+     * 2. 创建InvokerDelegate代理对象，包装原始Invoker和providerUrl
+     * 3. 通过exporterFactory创建ReferenceCountExporter，实现引用计数管理的Exporter
+     * 4. 使用双层Map结构缓存ExporterChangeableWrapper：
+     *    - 第一层key：providerUrlKey（服务提供者URL的标识）
+     *    - 第二层key：registryUrlKey（注册中心URL的标识）
+     * 5. 如果缓存中不存在，则创建新的ExporterChangeableWrapper并缓存
+     * <p>
+     * 该方法支持同一服务向多个注册中心注册的场景，
+     * 通过双层缓存结构确保服务的正确管理和复用。
+     *
+     * @param originInvoker 原始的Invoker对象，包含服务引用的所有信息
+     * @param providerUrl 服务提供者的URL地址
+     * @param <T> 服务接口的泛型类型
+     * @return 封装后的ExporterChangeableWrapper对象
+     */
     @SuppressWarnings("unchecked")
     private <T> ExporterChangeableWrapper<T> doLocalExport(final Invoker<T> originInvoker, URL providerUrl) {
+        // 获取providerUrl和registryUrl的唯一标识key
         String providerUrlKey = getProviderUrlKey(originInvoker);
         String registryUrlKey = getRegistryUrlKey(originInvoker);
+
+        // 创建InvokerDelegate，包装原始Invoker和providerUrl
         Invoker<?> invokerDelegate = new InvokerDelegate<>(originInvoker, providerUrl);
 
+        // 创建支持引用计数的Exporter，延迟执行protocol.export()
         ReferenceCountExporter<?> exporter =
                 exporterFactory.createExporter(providerUrlKey, () -> protocol.export(invokerDelegate));
+
+        // 使用双层Map结构缓存ExporterChangeableWrapper，支持同一服务向多个注册中心注册
         return (ExporterChangeableWrapper<T>) ConcurrentHashMapUtils.computeIfAbsent(
                 ConcurrentHashMapUtils.computeIfAbsent(bounds, providerUrlKey, k -> new ConcurrentHashMap<>()),
                 registryUrlKey,
                 s -> new ExporterChangeableWrapper<>((ReferenceCountExporter<T>) exporter, originInvoker));
     }
+
 
     public <T> void reExport(Exporter<T> exporter, URL newInvokerUrl) {
         if (exporter instanceof ExporterChangeableWrapper) {
@@ -514,6 +541,31 @@ public class RegistryProtocol implements Protocol, ScopeModelAware {
         }
     }
 
+        /**
+     * 执行服务的重新导出操作，注销旧的服务URL并注册新的服务URL。
+     * <p>
+     * 该方法用于处理服务配置变更时的动态更新场景，例如服务地址变化、参数调整等。
+     * 主要执行以下操作：
+     * <ol>
+     *   <li>检查导出器是否已注册，如果未注册则跳过注册中心的注销和注册操作</li>
+     *   <li>获取Registry对象，调用reExportUnregister()注销旧的服务URL</li>
+     *   <li>调用reExportRegister()注册新的服务URL，实现服务信息的更新</li>
+     *   <li>更新ProviderModel中的StatedURL，将提供者URL替换为新的URL</li>
+     *   <li>更新导出器中保存的注册URL，保持状态一致性</li>
+     * </ol>
+     * </p>
+     * <p>
+     * 异常处理策略：所有异常都会被包装为SkipFailbackWrapperException抛出，
+     * 由上层的失败重试机制进行处理，确保重新导出操作的可靠性。
+     * </p>
+     *
+     * @param originInvoker 原始的Invoker对象，用于获取注册中心信息
+     * @param exporter 可变更的导出器包装器，用于管理和更新导出状态
+     * @param registryUrl 注册中心的URL地址
+     * @param oldProviderUrl 需要被注销的旧服务URL
+     * @param newProviderUrl 需要被注册的新服务URL
+     * @throws SkipFailbackWrapperException 当获取注册中心或更新状态失败时抛出
+     */
     private <T> void doReExport(
             final Invoker<T> originInvoker,
             ExporterChangeableWrapper<T> exporter,
@@ -529,12 +581,21 @@ public class RegistryProtocol implements Protocol, ScopeModelAware {
             }
 
             logger.info("Try to unregister old url: " + oldProviderUrl);
+            /*
+             * 注销旧的服务URL，从注册中心移除过期的服务信息
+             */
             registry.reExportUnregister(oldProviderUrl);
 
             logger.info("Try to register new url: " + newProviderUrl);
+            /*
+             * 注册新的服务URL，向注册中心发布最新的服务信息
+             */
             registry.reExportRegister(newProviderUrl);
         }
         try {
+            /*
+             * 更新内存中的服务状态，确保ProviderModel和导出器持有最新的URL配置
+             */
             ProviderModel.RegisterStatedURL statedUrl = getStatedUrl(registryUrl, newProviderUrl);
             statedUrl.setProviderUrl(newProviderUrl);
             exporter.setRegisterUrl(newProviderUrl);
@@ -542,6 +603,7 @@ public class RegistryProtocol implements Protocol, ScopeModelAware {
             throw new SkipFailbackWrapperException(e);
         }
     }
+
 
     private ProviderModel.RegisterStatedURL getStatedUrl(URL registryUrl, URL providerUrl) {
         ProviderModel providerModel =
@@ -1268,10 +1330,34 @@ public class RegistryProtocol implements Protocol, ScopeModelAware {
         private NotifyListener notifyListener;
         private final AtomicBoolean registered = new AtomicBoolean(false);
 
+        /**
+         * 构造可变更的导出器包装器，初始化导出器、原始调用器和共享线程池。
+         * <p>
+         * 该构造方法在创建包装器时会执行以下操作：
+         * <ol>
+         *   <li>保存传入的ReferenceCountExporter和原始Invoker引用</li>
+         *   <li>增加导出器的引用计数，确保资源不会被提前释放</li>
+         *   <li>从FrameworkModel中获取FrameworkExecutorRepository，并从中获取共享的定时任务线程池</li>
+         * </ol>
+         * </p>
+         * <p>
+         * 该包装器主要用于支持服务导出的动态变更场景（如重新导出、取消导出等），
+         * 通过引用计数管理导出器的生命周期，通过共享线程池执行异步任务。
+         * </p>
+         *
+         * @param exporter 带引用计数的导出器对象，用于管理服务导出状态
+         * @param originInvoker 原始的Invoker对象，包含服务接口、实现类引用、URL配置等信息
+         */
         public ExporterChangeableWrapper(ReferenceCountExporter<T> exporter, Invoker<T> originInvoker) {
             this.exporter = exporter;
+            /*
+             * 增加导出器的引用计数，防止在其他地方关闭时影响当前包装器的使用
+             */
             exporter.increaseCount();
             this.originInvoker = originInvoker;
+            /*
+             * 从框架模型中获取共享的定时任务线程池，用于执行异步导出任务
+             */
             FrameworkExecutorRepository frameworkExecutorRepository = originInvoker
                     .getUrl()
                     .getOrDefaultFrameworkModel()
@@ -1279,6 +1365,7 @@ public class RegistryProtocol implements Protocol, ScopeModelAware {
                     .getBean(FrameworkExecutorRepository.class);
             this.executor = frameworkExecutorRepository.getSharedScheduledExecutor();
         }
+
 
         public Invoker<T> getOriginInvoker() {
             return originInvoker;
@@ -1293,13 +1380,36 @@ public class RegistryProtocol implements Protocol, ScopeModelAware {
             this.exporter = exporter;
         }
 
+                /**
+         * 将服务注册到注册中心，并更新提供者模型中的注册状态。
+         * <p>
+         * 该方法通过CAS操作保证注册逻辑只执行一次，避免重复注册。主要执行以下操作：
+         * <ol>
+         *   <li>从原始Invoker中获取注册中心URL和Registry对象</li>
+         *   <li>调用RegistryProtocol.register()方法将服务URL注册到注册中心</li>
+         *   <li>从服务仓库中查找对应的ProviderModel，获取其关联的所有StatedURL</li>
+         *   <li>过滤出匹配当前注册中心和协议的StatedURL，将其注册状态标记为true</li>
+         *   <li>记录注册成功的日志，包含服务键、服务URL和注册中心地址</li>
+         * </ol>
+         * </p>
+         * <p>
+         * 该方法通常在服务导出成功后调用，确保服务信息被正确发布到注册中心，
+         * 使得消费者可以发现并订阅该服务。
+         * </p>
+         */
         @Override
         public void register() {
+            /*
+             * 使用CAS操作保证注册逻辑只执行一次，避免重复注册
+             */
             if (registered.compareAndSet(false, true)) {
                 URL registryUrl = getRegistryUrl(originInvoker);
                 Registry registry = getRegistry(registryUrl);
                 RegistryProtocol.register(registry, getRegisterUrl());
 
+                /*
+                 * 更新提供者模型中的注册状态，标记对应的StatedURL为已注册
+                 */
                 ProviderModel providerModel = frameworkModel
                         .getServiceRepository()
                         .lookupExportedService(getRegisterUrl().getServiceKey());
@@ -1316,6 +1426,7 @@ public class RegistryProtocol implements Protocol, ScopeModelAware {
                         + registryUrl);
             }
         }
+
 
         @Override
         public synchronized void unregister() {

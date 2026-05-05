@@ -184,6 +184,25 @@ public class DefaultFilterChainBuilder implements FilterChainBuilder {
      * @param url URL
      * @return All ModuleModels in the url
      */
+    /**
+     * 从URL中提取关联的模块模型列表，用于确定过滤器加载的模块范围。
+     * <p>
+     * 在应用级服务注册发现策略下，URL类型为InstanceAddressURL，它属于应用层并持有ApplicationModel，
+     * 而过滤器位于模块层并持有ModuleModel。因此需要根据URL中的ScopeModel类型解析出所有关联的模块模型，
+     * 以便正确获取过滤器配置。
+     * </p>
+     * <p>
+     * 处理逻辑：
+     * <ul>
+     *   <li>如果ScopeModel是ApplicationModel类型，则获取其下所有的公共模块模型列表（支持多模块场景）</li>
+     *   <li>如果ScopeModel是ModuleModel类型，则将其包装为单元素列表返回（单模块场景）</li>
+     *   <li>其他情况返回null</li>
+     * </ul>
+     * </p>
+     *
+     * @param url 包含ScopeModel信息的URL对象，用于提取模块模型
+     * @return 模块模型列表，可能为null；单模块场景返回单元素列表，多模块场景返回多个模块模型
+     */
     private List<ModuleModel> getModuleModelsFromUrl(URL url) {
         List<ModuleModel> moduleModels = null;
         ScopeModel scopeModel = url.getScopeModel();
@@ -195,4 +214,5 @@ public class DefaultFilterChainBuilder implements FilterChainBuilder {
         }
         return moduleModels;
     }
+
 }

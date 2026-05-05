@@ -59,7 +59,7 @@ public class ChannelHandlers {
         //这里的dispatch默认是通过AllDispatcher.dispatch来处理的,从而获取得到一个AllChannelHandler(handler,url),
         //然后把AllChannelHandler 包装成HeartbeatHardler,HeartbeatHandler 包装成MultiMessageHandler
         //所以当Netty接收到一个数据时，会经历
-        // MultiMessageHandler--->HeartbeatHandle>AllChannelHandler ->ExchangeHandlerAdapter ->DecodeHandler-HeaderExchangeHandle
+        // MultiMessageHandler--->HeartbeatHandler>AllChannelHandler ->ExchangeHandlerAdapter ->DecodeHandler-HeaderExchangeHandler
         return new MultiMessageHandler(new HeartbeatHandler(url.getOrDefaultFrameworkModel()
                 .getExtensionLoader(Dispatcher.class)
                 .getAdaptiveExtension()

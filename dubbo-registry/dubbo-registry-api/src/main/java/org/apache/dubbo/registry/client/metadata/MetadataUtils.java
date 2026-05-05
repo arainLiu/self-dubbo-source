@@ -74,6 +74,36 @@ import static org.apache.dubbo.rpc.Constants.PROXY_KEY;
 public class MetadataUtils {
     public static final ErrorTypeAwareLogger logger = LoggerFactory.getErrorTypeAwareLogger(MetadataUtils.class);
 
+        /**
+     * 发布服务定义元数据到远程元数据中心，支持提供者和消费者两种模式。
+     * <p>
+     * 该方法用于将服务的完整定义信息（包括接口、方法、参数类型等）发布到配置的元数据报告中，
+     * 使得服务治理平台可以获取详细的服务契约信息，用于服务测试、Mock、监控等场景。
+     * </p>
+     * <p>
+     * 处理流程：
+     * <ol>
+     *   <li>检查是否配置了元数据报告，如果未配置则记录日志并直接返回</li>
+     *   <li>根据URL的side参数判断是提供者还是消费者：
+     *     <ul>
+     *       <li><b>提供者模式</b>：从ServiceDescriptor中获取FullServiceDefinition，设置URL参数后，
+     *           遍历所有元数据报告，调用storeProviderMetadata()存储服务定义</li>
+     *       <li><b>消费者模式</b>：遍历所有元数据报告，调用storeConsumerMetadata()仅存储消费者的URL参数</li>
+     *     </ul>
+     *   </li>
+     *   <li>对于每个元数据报告，检查是否启用了服务定义上报功能（shouldReportDefinition），未启用则跳过</li>
+     *   <li>构造MetadataIdentifier作为唯一标识，包含服务接口、版本、分组、端类型和应用名称</li>
+     * </ol>
+     * </p>
+     * <p>
+     * 异常处理策略：所有异常都会被捕获并记录错误日志，不会中断业务流程，
+     * 因为元数据发布是辅助功能，不影响核心的服务注册发现。
+     * </p>
+     *
+     * @param url 服务URL，包含服务接口、版本、分组、端类型等信息
+     * @param serviceDescriptor 服务描述符对象，用于获取服务的完整定义信息（仅提供者模式使用）
+     * @param applicationModel 应用模型，用于获取元数据报告实例和应用名称
+     */
     public static void publishServiceDefinition(
             URL url, ServiceDescriptor serviceDescriptor, ApplicationModel applicationModel) {
         if (getMetadataReports(applicationModel).isEmpty()) {
@@ -85,6 +115,9 @@ public class MetadataUtils {
         try {
             String side = url.getSide();
             if (PROVIDER_SIDE.equalsIgnoreCase(side)) {
+                /*
+                 * 提供者模式：发布完整的服务定义信息到元数据中心
+                 */
                 String serviceKey = url.getServiceKey();
                 FullServiceDefinition serviceDefinition = serviceDescriptor.getFullServiceDefinition(serviceKey);
 
@@ -108,6 +141,9 @@ public class MetadataUtils {
                     }
                 }
             } else {
+                /*
+                 * 消费者模式：仅发布消费者的URL参数到元数据中心
+                 */
                 for (Map.Entry<String, MetadataReport> entry :
                         getMetadataReports(applicationModel).entrySet()) {
                     MetadataReport metadataReport = entry.getValue();
@@ -130,6 +166,7 @@ public class MetadataUtils {
             logger.error(REGISTRY_FAILED_CREATE_INSTANCE, "", "", "publish service definition metadata error.", e);
         }
     }
+
 
     /**
      * 引用远程元数据服务，创建用于拉取提供者MetadataInfo的RPC代理对象。

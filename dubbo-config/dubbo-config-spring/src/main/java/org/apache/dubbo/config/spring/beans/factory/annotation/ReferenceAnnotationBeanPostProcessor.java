@@ -242,9 +242,6 @@ public class ReferenceAnnotationBeanPostProcessor extends AbstractAnnotationBean
         }
     }
 
-    // ... existing code ...
-
-
     /**
      * check whether is @DubboReference at java-config @bean method
      */
@@ -361,11 +358,28 @@ public class ReferenceAnnotationBeanPostProcessor extends AbstractAnnotationBean
         beanDefinition.getPropertyValues().add(ReferenceAttributes.ID, beanName);
     }
 
+    /**
+     * 处理合并后的Bean定义，准备@Reference注解的注入元数据
+     * <p>
+     * 该方法在Spring Bean定义合并完成后被调用，主要执行以下操作：
+     * 1. 判断Bean类型是否为ReferenceBean，如果是则标记属性值为可选
+     * 2. 判断是否为注解方式的ReferenceBean（预留逻辑）
+     * 3. 对于普通Bean，查找包含@Reference注解的注入元数据
+     * 4. 检查配置成员并验证注解的有效性
+     * 5. 准备注入所需的资源和依赖
+     * <p>
+     * 该方法是Spring Bean生命周期中的重要环节，确保@Reference注解
+     * 能够在后续的属性填充阶段正确注入。
+     *
+     * @param beanDefinition 合并后的根Bean定义
+     * @param beanType Bean的类型
+     * @param beanName Bean的名称
+     */
     @Override
     public void postProcessMergedBeanDefinition(RootBeanDefinition beanDefinition, Class<?> beanType, String beanName) {
         if (beanType != null) {
             if (isReferenceBean(beanDefinition)) {
-                // mark property value as optional
+                // 对于ReferenceBean类型的Bean，标记所有属性值为可选，避免依赖检查失败
                 List<PropertyValue> propertyValues =
                         beanDefinition.getPropertyValues().getPropertyValueList();
                 for (PropertyValue propertyValue : propertyValues) {
@@ -375,9 +389,14 @@ public class ReferenceAnnotationBeanPostProcessor extends AbstractAnnotationBean
                 // extract beanClass from java-config bean method generic return type: ReferenceBean<DemoService>
                 // Class beanClass = getBeanFactory().getType(beanName);
             } else {
+                // 对于普通Bean，查找@Reference注解的注入元数据
                 AnnotatedInjectionMetadata metadata = findInjectionMetadata(beanName, beanType, null);
+
+                // 检查配置成员并验证注解的有效性
                 metadata.checkConfigMembers(beanDefinition);
+
                 try {
+                    // 准备注入所需的资源和依赖
                     prepareInjection(metadata);
                 } catch (Exception e) {
                     throw new IllegalStateException("Prepare dubbo reference injection element failed", e);
@@ -387,10 +406,21 @@ public class ReferenceAnnotationBeanPostProcessor extends AbstractAnnotationBean
     }
 
     /**
-     * Alternatives to the {@link #postProcessProperties(PropertyValues, Object, String)}, that removed as of Spring
-     * Framework 6.0.0, and in favor of {@link #postProcessProperties(PropertyValues, Object, String)}.
-     * <p>In order to be compatible with the lower version of Spring, it is still retained.
+     * 处理@Reference注解的属性注入（Spring 6.0之前版本的兼容方法）
+     * <p>
+     * 该方法是{@link #postProcessProperties(PropertyValues, Object, String)}的替代方案，
+     * 在Spring Framework 6.0.0中已被移除，取而代之的是{@link #postProcessProperties(PropertyValues, Object, String)}。
+     * 为了保持与低版本Spring的兼容性，该方法仍然被保留。
+     * <p>
+     * 该方法直接委托给{@link #postProcessProperties(PropertyValues, Object, String)}执行实际的处理逻辑，
+     * 确保在不同Spring版本间的一致性。
      *
+     * @param pvs 当前Bean的属性值集合
+     * @param pds Bean的属性描述符数组（已废弃，不再使用）
+     * @param bean 正在处理的Bean实例
+     * @param beanName Bean的名称
+     * @return 处理后的属性值集合，可能被修改以包含注入的值
+     * @throws BeansException 当Bean处理发生错误时抛出
      * @see #postProcessProperties
      */
     public PropertyValues postProcessPropertyValues(
@@ -399,16 +429,35 @@ public class ReferenceAnnotationBeanPostProcessor extends AbstractAnnotationBean
     }
 
     /**
-     * Alternatives to the {@link #postProcessPropertyValues(PropertyValues, PropertyDescriptor[], Object, String)}.
+     * 处理@Reference注解的属性注入（Spring 5.1+新API）
+     * <p>
+     * 该方法是{@link #postProcessPropertyValues(PropertyValues, PropertyDescriptor[], Object, String)}的替代方案，
+     * 在Spring 5.1及更高版本中被调用。主要执行以下操作：
+     * 1. 查找包含@Reference注解的注入元数据（字段和方法）
+     * 2. 准备注入所需的资源和依赖
+     * 3. 执行实际的依赖注入操作，将ReferenceBean注入到目标Bean中
+     * 4. 处理注入过程中可能出现的异常
+     * <p>
+     * 该方法用于处理Spring Bean属性填充阶段的@Reference注解注入，
+     * 支持字段注入和setter方法注入两种方式。
      *
-     * @see #postProcessPropertyValues
+     * @param pvs 当前Bean的属性值集合
+     * @param bean 正在处理的Bean实例
+     * @param beanName Bean的名称
+     * @return 处理后的属性值集合，可能被修改以包含注入的值
+     * @throws BeansException 当Bean处理发生错误时抛出
      */
     @Override
     public PropertyValues postProcessProperties(PropertyValues pvs, Object bean, String beanName)
             throws BeansException {
         try {
+            // 查找包含@Reference注解的注入元数据
             AnnotatedInjectionMetadata metadata = findInjectionMetadata(beanName, bean.getClass(), pvs);
+
+            // 准备注入所需的资源和依赖
             prepareInjection(metadata);
+
+            // 执行实际的依赖注入操作
             metadata.inject(bean, beanName, pvs);
         } catch (BeansException ex) {
             throw ex;

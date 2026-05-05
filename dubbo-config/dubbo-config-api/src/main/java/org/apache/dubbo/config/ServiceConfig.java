@@ -321,48 +321,95 @@ public class ServiceConfig<T> extends ServiceConfigBase<T> {
         serviceMetadata.generateServiceKey();
     }
 
+    /**
+     * 导出Dubbo服务
+     * <p>
+     * 该方法是ServiceConfig的核心入口，负责将Dubbo服务暴露给外部调用者。
+     * 采用双重检查锁定机制确保线程安全，主要执行以下操作：
+     * 1. 检查是否已导出，避免重复导出
+     * 2. 确保ModuleDeployer已启动或准备就绪
+     * 3. 刷新配置信息（如果未刷新）
+     * 4. 判断是否应该导出服务（通过shouldExport方法）
+     * 5. 初始化ServiceConfig的各项配置
+     * 6. 根据不同的延迟策略执行导出：
+     *    - 延迟导出：使用定时器延迟执行
+     *    - 手动注册：导出但不自动注册到注册中心
+     *    - 正常导出：立即导出并注册
+     * 7. 注册服务实例到注册中心（应用级服务发现）
+     * <p>
+     * 该方法支持多种导出模式和延迟策略，适应不同的业务场景需求。
+     *
+     * @param registerType 注册类型，决定是接口级注册、应用级注册、手动注册还是不注册
+     */
     @Override
     public void export(RegisterTypeEnum registerType) {
+        // 检查是否已导出，避免重复导出
         if (this.exported) {
             return;
         }
 
+        // 确保ModuleDeployer已启动或准备就绪
         if (getScopeModel().isLifeCycleManagedExternally()) {
-            // prepare model for reference
+            // prepare model for reference，如果生命周期由外部管理，则仅准备
             getScopeModel().getDeployer().prepare();
         } else {
-            // ensure start module, compatible with old api usage
+            // ensure start module, compatible with old api usage，否则启动模块
             getScopeModel().getDeployer().start();
         }
 
+        // 使用同步锁保证线程安全
         synchronized (this) {
             if (this.exported) {
                 return;
             }
 
+            // 如果配置未刷新，则先刷新配置
             if (!this.isRefreshed()) {
                 this.refresh();
             }
+
+            // 判断是否应该导出服务
             if (this.shouldExport()) {
+                // 初始化ServiceConfig
                 this.init();
 
+                // 根据不同的延迟策略执行导出
                 if (shouldDelay()) {
-                    // should register if delay export
+                    // should register if delay export，延迟导出策略
                     doDelayExport();
                 } else if (Integer.valueOf(-1).equals(getDelay())
                         && Boolean.parseBoolean(ConfigurationUtils.getProperty(
                                 getScopeModel(), CommonConstants.DubboProperty.DUBBO_MANUAL_REGISTER_KEY, "false"))) {
-                    // should not register by default
+                    // should not register by default，手动注册模式（delay=-1且配置了手动注册）
                     doExport(RegisterTypeEnum.MANUAL_REGISTER);
                 } else {
+                    // 正常导出模式
                     doExport(registerType);
                 }
             }
         }
 
+        // 注册服务实例到注册中心（应用级服务发现）
         getScopeModel().getDeployer().registerServiceInstance();
     }
 
+    /**
+     * 将服务注册到注册中心，支持自动注册和部署器触发注册两种模式。
+     * <p>
+     * 该方法负责将已导出的服务信息注册到一个或多个注册中心。在注册前会进行双重检查确保服务已导出，
+     * 并使用同步块保证线程安全。根据注册类型将Exporter分为两组：
+     * <ul>
+     *   <li><b>AUTO_REGISTER</b>：自动注册的Exporter，每次调用都会执行注册</li>
+     *   <li><b>AUTO_REGISTER_BY_DEPLOYER</b>：由部署器触发注册的Exporter，仅当byDeployer参数为true时才执行注册</li>
+     * </ul>
+     * </p>
+     * <p>
+     * 这种设计允许服务在不同的场景下采用不同的注册策略，例如某些服务可能需要在特定条件满足后
+     * 才由部署器统一触发注册，而不是在导出后立即注册。
+     * </p>
+     *
+     * @param byDeployer 标识是否由部署器触发注册，为true时会额外注册AUTO_REGISTER_BY_DEPLOYER类型的Exporter
+     */
     @Override
     public void register(boolean byDeployer) {
         if (!this.exported) {
@@ -374,11 +421,17 @@ public class ServiceConfig<T> extends ServiceConfigBase<T> {
                 return;
             }
 
+            /*
+             * 注册所有自动注册类型的Exporter
+             */
             for (Exporter<?> exporter :
                     exporters.getOrDefault(RegisterTypeEnum.AUTO_REGISTER, Collections.emptyList())) {
                 exporter.register();
             }
 
+            /*
+             * 如果由部署器触发，则额外注册由部署器管理的Exporter
+             */
             if (byDeployer) {
                 for (Exporter<?> exporter :
                         exporters.getOrDefault(RegisterTypeEnum.AUTO_REGISTER_BY_DEPLOYER, Collections.emptyList())) {
@@ -660,12 +713,32 @@ public class ServiceConfig<T> extends ServiceConfigBase<T> {
         exported();
     }
 
+    /**
+     * 执行服务URL的导出和注册
+     * <p>
+     * 该方法是服务导出的核心逻辑，负责将Dubbo服务暴露给外部调用者。主要执行以下操作：
+     * 1. 获取或创建ServiceDescriptor，描述服务的元数据信息
+     * 2. 处理ServerService类型的特殊服务（如stub服务）
+     * 3. 创建ProviderModel，封装服务提供者模型
+     * 4. 将ProviderModel注册到服务仓库
+     * 5. 加载注册中心URL列表（如果启用了注册）
+     * 6. 遍历所有协议配置，逐个协议导出服务URL
+     * 7. 设置ProviderModel的服务URL列表
+     * <p>
+     * 该方法支持接口级注册和应用级注册两种模式，
+     * 并能够处理普通服务和stub服务的不同导出逻辑。
+     *
+     * @param registerType 注册类型，决定是接口级注册还是应用级注册
+     */
     @SuppressWarnings({"unchecked", "rawtypes"})
     private void doExportUrls(RegisterTypeEnum registerType) {
         ModuleServiceRepository repository = getScopeModel().getServiceRepository();
         ServiceDescriptor serviceDescriptor;
         final boolean serverService = ref instanceof ServerService;
+
+        // 根据服务类型获取或注册ServiceDescriptor
         if (serverService) {
+            // 处理ServerService类型的服务（如stub服务）
             serviceDescriptor = ((ServerService) ref).getServiceDescriptor();
             if (!this.provider.getUseJavaPackageAsPath()) {
                 // for stub service, path always interface name or IDL package name
@@ -673,8 +746,11 @@ public class ServiceConfig<T> extends ServiceConfigBase<T> {
             }
             repository.registerService(serviceDescriptor);
         } else {
+            // 普通服务，直接注册接口类
             serviceDescriptor = repository.registerService(getInterfaceClass());
         }
+
+        // 创建ProviderModel，封装服务提供者相关信息
         providerModel = new ProviderModel(
                 serviceMetadata.getServiceKey(),
                 ref,
@@ -684,47 +760,85 @@ public class ServiceConfig<T> extends ServiceConfigBase<T> {
                 interfaceClassLoader);
 
         // Compatible with dependencies on ServiceModel#getServiceConfig(), and will be removed in a future version
+        // 设置ProviderModel与ServiceConfig的关联关系（兼容性代码，未来版本会移除）
         providerModel.setConfig(this);
 
+        // 设置销毁时的清理任务
         providerModel.setDestroyRunner(getDestroyRunner());
+
+        // 注册ProviderModel到服务仓库
         repository.registerProvider(providerModel);
-        //这里接口级注册和应用级注册有区别
+
+        //这里接口级注册和应用级注册有区别，加载注册中心URL列表
+        //接口级注册：registry://127.0.0.1:2181/org.apache.dubbo.registry.RegistryService?REGISTRY_CLUSTER=default&application=dubbo-sp-demo-provider&dubbo=2.0.2&executor-management-mode=isolation&file-cache=true&metadata-type=remote&pid=77183&qos.enable=false&register-mode=interface&registry=zookeeper&release=3.3.7-SNAPSHOT&timestamp=1777879210168
+        //应用级注册：service-discovery-registry://127.0.0.1:2181/org.apache.dubbo.registry.RegistryService?REGISTRY_CLUSTER=default&application=dubbo-sp-demo-provider&dubbo=2.0.2&executor-management-mode=isolation&file-cache=true&metadata-type=remote&pid=15260&qos.enable=false&registry=zookeeper&release=3.3.7-SNAPSHOT&timestamp=1777807583644
         List<URL> registryURLs = !Boolean.FALSE.equals(isRegister())
                 ? ConfigValidationUtils.loadRegistries(this, true)
                 : Collections.emptyList();
 
+        // 遍历所有协议配置，逐个协议导出服务
         for (ProtocolConfig protocolConfig : protocols) {
             String pathKey = URL.buildKey(
                     getContextPath(protocolConfig).map(p -> p + "/" + path).orElse(path), group, version);
+
             // stub service will use generated service name
             if (!serverService) {
                 // In case user specified path, register service one more time to map it to path.
+                // 如果不是stub服务且用户指定了path，则额外注册一次以映射到path
                 repository.registerService(pathKey, interfaceClass);
             }
+
+            // 针对单个协议导出服务URL
             doExportUrlsFor1Protocol(protocolConfig, registryURLs, registerType);
         }
 
+        // 设置ProviderModel的服务URL列表
         providerModel.setServiceUrls(urls);
     }
 
+    /**
+     * 针对单个协议导出服务URL
+     * <p>
+     * 该方法负责将一个Dubbo服务按照指定的协议进行导出，主要执行以下操作：
+     * 1. 构建服务属性Map，包含所有配置参数
+     * 2. 清理空键和空值的属性，避免无效配置
+     * 3. 将属性添加到serviceMetadata的attachments中，用于元数据传递
+     * 4. 构建完整的服务URL，包含协议、主机、端口、路径等信息
+     * 5. 处理服务执行器配置，初始化线程池等资源
+     * 6. 检查注册中心列表，如果为空则设置注册类型为NEVER_REGISTER
+     * 7. 执行服务导出和注册操作
+     * 8. 初始化服务方法的指标监控
+     *
+     * @param protocolConfig 协议配置对象，包含协议类型、端口等配置
+     * @param registryURLs 注册中心URL列表，用于服务注册
+     * @param registerType 注册类型，决定是接口级注册、应用级注册还是不注册
+     */
     private void doExportUrlsFor1Protocol(
             ProtocolConfig protocolConfig, List<URL> registryURLs, RegisterTypeEnum registerType) {
+        // 构建服务属性Map，包含协议、超时、负载均衡等配置
         Map<String, String> map = buildAttributes(protocolConfig);
 
-        // remove null key and null value
+        // remove null key and null value，清理空键和空值的属性
         map.keySet().removeIf(key -> StringUtils.isEmpty(key) || StringUtils.isEmpty(map.get(key)));
-        // init serviceMetadata attachments
+
+        // init serviceMetadata attachments，将属性添加到服务元数据的附件中
         serviceMetadata.getAttachments().putAll(map);
 
+        // 构建完整的服务URL
         URL url = buildUrl(protocolConfig, map);
 
+        // 处理服务执行器配置，初始化线程池等资源
         processServiceExecutor(url);
 
+        // 如果没有注册中心，则设置为不注册模式
         if (CollectionUtils.isEmpty(registryURLs)) {
             registerType = RegisterTypeEnum.NEVER_REGISTER;
         }
+
+        // 执行服务导出和注册操作
         exportUrl(url, registryURLs, registerType);
 
+        // 初始化服务方法的指标监控
         initServiceMethodMetrics(url);
     }
 
@@ -954,83 +1068,152 @@ public class ServiceConfig<T> extends ServiceConfigBase<T> {
         return url;
     }
 
+    /**
+     * 导出服务URL到本地和/或远程
+     * <p>
+     * 该方法根据scope参数控制服务的导出范围，支持以下三种模式：
+     * 1. 本地导出（scope=local）：仅导出到本地JVM，不进行远程注册
+     * 2. 远程导出（scope=remote）：仅导出到远程注册中心
+     * 3. 默认模式（scope为空或其他）：同时导出到本地和远程
+     * <p>
+     * 主要执行以下操作：
+     * 1. 检查scope配置，决定是否导出服务
+     * 2. 如果不是remote模式，则执行本地导出（exportLocal）
+     * 3. 如果不是local模式，则执行远程导出（exportRemote）
+     * 4. 处理扩展协议（extProtocol），支持多协议同时暴露
+     * 5. 发布服务定义到元数据中心（非泛化调用且非内部服务）
+     * 6. 将导出的URL添加到urls列表中
+     *
+     * @param url 要导出的服务URL
+     * @param registryURLs 注册中心URL列表
+     * @param registerType 注册类型，决定是接口级注册、应用级注册还是不注册
+     */
     private void exportUrl(URL url, List<URL> registryURLs, RegisterTypeEnum registerType) {
         String scope = url.getParameter(SCOPE_KEY);
+
         // don't export when none is configured
+        // 如果配置了SCOPE_NONE，则不导出服务
         if (!SCOPE_NONE.equalsIgnoreCase(scope)) {
 
             // export to local if the config is not remote (export to remote only when config is remote)
+            // 如果不是remote模式，则执行本地导出
             if (!SCOPE_REMOTE.equalsIgnoreCase(scope)) {
                 exportLocal(url);
             }
 
             // export to remote if the config is not local (export to local only when config is local)
+            // 如果不是local模式，则执行远程导出
             if (!SCOPE_LOCAL.equalsIgnoreCase(scope)) {
                 // export to extra protocol is used in remote export
+                // 获取扩展协议配置，支持多协议暴露
                 String extProtocol = url.getParameter(EXT_PROTOCOL, "");
                 List<String> protocols = new ArrayList<>();
 
                 if (StringUtils.isNotBlank(extProtocol)) {
-                    // export original url
+                    // export original url，如果有扩展协议，标记原URL为PU服务器
                     url = URLBuilder.from(url)
                             .addParameter(IS_PU_SERVER_KEY, Boolean.TRUE.toString())
                             .build();
                 }
 
+                // 执行远程导出，注册到注册中心
                 url = exportRemote(url, registryURLs, registerType);
+
+                // 发布服务定义到元数据中心（非泛化调用且非内部服务）
                 if (!isGeneric(generic) && !getScopeModel().isInternal()) {
                     MetadataUtils.publishServiceDefinition(url, providerModel.getServiceModel(), getApplicationModel());
                 }
 
+                // 处理扩展协议，拆分协议列表
                 if (StringUtils.isNotBlank(extProtocol)) {
                     String[] extProtocols = extProtocol.split(",", -1);
                     protocols.addAll(Arrays.asList(extProtocols));
                 }
-                // export extra protocols
+
+                // export extra protocols，遍历并导出扩展协议
                 for (String protocol : protocols) {
                     if (StringUtils.isNotBlank(protocol)) {
+                        // 构建扩展协议的URL，标记为额外协议
                         URL localUrl = URLBuilder.from(url)
                                 .setProtocol(protocol)
                                 .addParameter(IS_EXTRA, Boolean.TRUE.toString())
                                 .removeParameter(EXT_PROTOCOL)
                                 .build();
+
+                        // 导出扩展协议到远程
                         localUrl = exportRemote(localUrl, registryURLs, registerType);
+
+                        // 发布扩展协议的服务定义到元数据中心
                         if (!isGeneric(generic) && !getScopeModel().isInternal()) {
                             MetadataUtils.publishServiceDefinition(
                                     localUrl, providerModel.getServiceModel(), getApplicationModel());
                         }
+
                         this.urls.add(localUrl);
                     }
                 }
             }
         }
+
+        // 将主URL添加到已导出列表中
         this.urls.add(url);
     }
 
+    /**
+     * 导出远程服务URL并注册到注册中心
+     * <p>
+     * 该方法负责将Dubbo服务导出到远程注册中心，主要执行以下操作：
+     * 1. 检查是否存在注册中心URL列表且注册类型不是NEVER_REGISTER
+     * 2. 遍历所有注册中心URL：
+     *    - 如果是服务发现注册中心，添加服务名称映射参数
+     *    - 跳过injvm协议（本地协议不注册）
+     *    - 添加动态注册参数
+     *    - 配置监控中心URL
+     *    - 传递代理配置参数
+     *    - 记录导出日志
+     *    - 执行实际的导出操作
+     * 3. 如果没有注册中心，则直接导出服务URL
+     * <p>
+     * 该方法支持实例注册和服务注册两种模式，
+     * 并通过registerType参数控制注册行为。
+     *
+     * @param url 要导出的服务URL
+     * @param registryURLs 注册中心URL列表
+     * @param registerType 注册类型，决定是接口级注册、应用级注册还是不注册
+     * @return 处理后的服务URL
+     */
     private URL exportRemote(URL url, List<URL> registryURLs, RegisterTypeEnum registerType) {
         if (CollectionUtils.isNotEmpty(registryURLs) && registerType != RegisterTypeEnum.NEVER_REGISTER) {
+            // 遍历所有注册中心，逐个注册服务
             for (URL registryURL : registryURLs) {
+                // 如果是服务发现注册中心，启用服务名称映射
                 if (SERVICE_REGISTRY_PROTOCOL.equals(registryURL.getProtocol())) {
                     url = url.addParameterIfAbsent(SERVICE_NAME_MAPPING_KEY, "true");
                 }
 
                 // if protocol is only injvm ,not register
+                // 跳过injvm协议，本地协议不需要注册
                 if (LOCAL_PROTOCOL.equalsIgnoreCase(url.getProtocol())) {
                     continue;
                 }
 
+                // 添加动态注册参数，从注册中心URL继承配置
                 url = url.addParameterIfAbsent(DYNAMIC_KEY, registryURL.getParameter(DYNAMIC_KEY));
+
+                // 配置监控中心
                 URL monitorUrl = ConfigValidationUtils.loadMonitor(this, registryURL);
                 if (monitorUrl != null) {
                     url = url.putAttribute(MONITOR_KEY, monitorUrl);
                 }
 
                 // For providers, this is used to enable custom proxy to generate invoker
+                // 传递代理配置参数，用于生成自定义代理Invoker
                 String proxy = url.getParameter(PROXY_KEY);
                 if (StringUtils.isNotEmpty(proxy)) {
                     registryURL = registryURL.addParameter(PROXY_KEY, proxy);
                 }
 
+                // 记录导出日志
                 if (logger.isInfoEnabled()) {
                     if (url.getParameter(REGISTER_KEY, true)) {
                         logger.info("[INSTANCE_REGISTER] Register dubbo service " + interfaceClass.getName() + " url "
@@ -1040,10 +1223,12 @@ public class ServiceConfig<T> extends ServiceConfigBase<T> {
                     }
                 }
 
+                // 执行实际的导出操作，将服务URL作为属性附加到注册中心URL上
                 doExportUrl(registryURL.putAttribute(EXPORT_KEY, url), true, registerType);
             }
 
         } else {
+            // 没有注册中心，直接导出服务URL
 
             if (logger.isInfoEnabled()) {
                 logger.info("[SERVICE_PUBLISH][METADATA_REGISTER] Export dubbo service " + interfaceClass.getName()

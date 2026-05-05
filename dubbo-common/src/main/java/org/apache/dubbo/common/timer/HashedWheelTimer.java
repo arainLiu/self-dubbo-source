@@ -83,6 +83,41 @@ import static org.apache.dubbo.common.constants.LoggerCodeConstants.COMMON_ERROR
  * timer facility'</a>.  More comprehensive slides are located
  * <a href="http://www.cse.wustl.edu/~cdgill/courses/cs6874/TimingWheels.ppt">here</a>.
  */
+/**
+ * 哈希时间轮定时器实现
+ * <p>
+ * HashedWheelTimer是一种高效的时间调度器，基于时间轮（Timing Wheel）算法实现，
+ * 适用于管理大量的定时任务。它的设计灵感来自于操作系统中的时间轮概念，
+ * 将时间划分为固定间隔的tick，并将任务分配到对应的槽位中。
+ * <p>
+ * 核心特性：
+ * 1. 时间复杂度：添加和取消任务都是O(1)操作
+ * 2. 内存效率：使用双向链表存储任务，避免额外的对象创建
+ * 3. 线程安全：支持多线程并发添加和取消任务
+ * 4. 资源限制：可配置最大待处理任务数，防止内存溢出
+ * 5. 自动启动：首次添加任务时自动启动后台工作线程
+ * <p>
+ * 工作原理：
+ * - 维护一个环形数组（wheel），每个元素是一个桶（HashedWheelBucket）
+ * - 每个桶存储一个双向链表，包含该时刻需要执行的任务
+ * - 工作线程（Worker）按照固定的tickDuration推进时间
+ * - 任务根据deadline计算应该放入哪个桶，以及需要绕多少圈（remainingRounds）
+ * - 每次tick时，处理当前桶中remainingRounds为0的任务
+ * <p>
+ * 使用场景：
+ * - Dubbo中的超时控制（如请求超时、连接超时）
+ * - 延迟任务的调度
+ * - 心跳检测等周期性任务
+ * <p>
+ * 注意事项：
+ * - 该类是共享资源，应该在JVM中复用，避免创建过多实例
+ * - 默认限制最多创建64个实例，超过会记录错误日志
+ * - 停止定时器时会返回未处理的任务，需要调用者自行处理
+ *
+ * @see Timer
+ * @see Timeout
+ * @see TimerTask
+ */
 public class HashedWheelTimer implements Timer {
 
     /**
@@ -287,6 +322,7 @@ public class HashedWheelTimer implements Timer {
                 "ticksPerWheel may not be greater than 2^30: " + ticksPerWheel);
         }
 
+        // 将ticksPerWheel规范化为2的幂次方，便于后续使用位运算
         ticksPerWheel = normalizeTicksPerWheel(ticksPerWheel);
         HashedWheelBucket[] wheel = new HashedWheelBucket[ticksPerWheel];
         for (int i = 0; i < wheel.length; i++) {
@@ -427,6 +463,18 @@ public class HashedWheelTimer implements Timer {
             "so that only a few instances are created.");
     }
 
+    /**
+     * 工作线程，负责推进时间轮并执行到期任务
+     * <p>
+     * Worker是HashedWheelTimer的核心组件，在独立的后台线程中运行。
+     * 主要职责包括：
+     * 1. 初始化startTime作为时间基准
+     * 2. 按照tickDuration周期性推进时间
+     * 3. 将待处理的任务从timeouts队列转移到对应的桶中
+     * 4. 处理已取消的任务
+     * 5. 执行到期的任务
+     * 6. 收集未处理的任务供stop()方法返回
+     */
     private final class Worker implements Runnable {
         private final Set<Timeout> unprocessedTimeouts = new HashSet<>();
 

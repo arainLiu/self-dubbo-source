@@ -51,6 +51,17 @@ import static org.springframework.beans.factory.support.BeanDefinitionBuilder.ro
  */
 public class DubboComponentScanRegistrar implements ImportBeanDefinitionRegistrar {
 
+    /**
+     * 注册Dubbo相关的Bean定义
+     * <p>
+     * 该方法在Spring导入Bean定义时被调用，主要执行以下操作：
+     * 1. 初始化Dubbo Spring容器
+     * 2. 获取需要扫描的包路径
+     * 3. 注册服务注解后置处理器以处理@Service注解
+     *
+     * @param importingClassMetadata 导入类的注解元数据，用于获取@DubboComponentScan或@EnableDubbo的配置信息
+     * @param registry Bean定义注册表，用于注册Dubbo相关的Bean定义
+     */
     @Override
     public void registerBeanDefinitions(AnnotationMetadata importingClassMetadata, BeanDefinitionRegistry registry) {
 
@@ -63,21 +74,41 @@ public class DubboComponentScanRegistrar implements ImportBeanDefinitionRegistra
     }
 
     /**
-     * Registers {@link ServiceAnnotationPostProcessor}
+     * 注册服务注解后置处理器
+     * <p>
+     * 该方法负责创建并注册{@link ServiceAnnotationPostProcessor} Bean，用于处理Dubbo的@Service注解。
+     * 主要步骤包括：
+     * 1. 构建BeanDefinition，指定ServiceAnnotationPostProcessor的类类型
+     * 2. 设置构造函数参数（要扫描的包路径）
+     * 3. 标记为基础设施Bean（ROLE_INFRASTRUCTURE）
+     * 4. 使用生成的名称注册到BeanDefinitionRegistry
      *
-     * @param packagesToScan packages to scan without resolving placeholders
-     * @param registry       {@link BeanDefinitionRegistry}
-     * @since 2.5.8
+     * @param packagesToScan 需要扫描的包路径集合，不包含占位符解析
+     * @param registry Bean定义注册表，用于注册ServiceAnnotationPostProcessor
      */
     private void registerServiceAnnotationPostProcessor(Set<String> packagesToScan, BeanDefinitionRegistry registry) {
 
+        // 构建ServiceAnnotationPostProcessor的BeanDefinition
         BeanDefinitionBuilder builder = rootBeanDefinition(SpringCompatUtils.serviceAnnotationPostProcessor());
         builder.addConstructorArgValue(packagesToScan);
         builder.setRole(BeanDefinition.ROLE_INFRASTRUCTURE);
         AbstractBeanDefinition beanDefinition = builder.getBeanDefinition();
+
+        // 使用生成的名称注册Bean定义
         BeanDefinitionReaderUtils.registerWithGeneratedName(beanDefinition, registry);
     }
 
+    /**
+     * 获取需要扫描的包路径集合
+     * <p>
+     * 该方法按照以下优先级获取包扫描路径：
+     * 1. 从@DubboComponentScan注解的basePackages或basePackageClasses属性获取
+     * 2. 如果未找到，则从@EnableDubbo注解的scanBasePackages或scanBasePackageClasses属性获取（兼容Spring 3.x）
+     * 3. 如果仍未找到，则默认使用导入类所在的包路径
+     *
+     * @param metadata Spring注解元数据，用于获取注解配置信息
+     * @return 需要扫描的包路径集合，不会返回null
+     */
     private Set<String> getPackagesToScan(AnnotationMetadata metadata) {
         // get from @DubboComponentScan
         Set<String> packagesToScan =
@@ -89,6 +120,7 @@ public class DubboComponentScanRegistrar implements ImportBeanDefinitionRegistra
                     getPackagesToScan0(metadata, EnableDubbo.class, "scanBasePackages", "scanBasePackageClasses");
         }
 
+        // 如果未配置任何包路径，则默认使用导入类所在的包
         if (packagesToScan.isEmpty()) {
             return Collections.singleton(ClassUtils.getPackageName(metadata.getClassName()));
         }

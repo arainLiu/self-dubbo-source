@@ -284,39 +284,60 @@ public class ConfigManager extends AbstractConfigManager implements ApplicationE
         getMetadataConfigs().forEach(MetadataReportConfig::refresh);
     }
 
+    /**
+     * 从配置属性中加载各种类型的Dubbo配置对象
+     * <p>
+     * 该方法负责从系统属性、配置文件等来源加载所有类型的Dubbo配置，包括：
+     * 1. ApplicationConfig - 应用配置（在启动配置中心之前已加载）
+     * 2. MonitorConfig - 监控配置
+     * 3. MetricsConfig - 指标配置
+     * 4. TracingConfig - 追踪配置
+     * 5. ProtocolConfig - 协议配置
+     * 6. RegistryConfig - 注册中心配置
+     * 7. MetadataReportConfig - 元数据报告配置
+     * <p>
+     * 加载完成后执行以下操作：
+     * - 刷新所有配置对象，使其生效
+     * - 检查配置的合法性和完整性
+     * - 设置应用模型的名称（如果未配置则使用应用名称）
+     * <p>
+     * 注意：ConfigCenterConfig在启动配置中心之前已经加载，因此此处不再重复加载。
+     */
     @Override
     public void loadConfigs() {
         // application config has load before starting config center
-        // load dubbo.applications.xxx
+        // 加载dubbo.applications.xxx配置
         loadConfigsOfTypeFromProps(ApplicationConfig.class);
 
-        // load dubbo.monitors.xxx
+        // load dubbo.monitors.xxx，加载监控配置
         loadConfigsOfTypeFromProps(MonitorConfig.class);
 
-        // load dubbo.metrics.xxx
+        // load dubbo.metrics.xxx，加载指标配置
         loadConfigsOfTypeFromProps(MetricsConfig.class);
 
-        // load dubbo.tracing.xxx
+        // load dubbo.tracing.xxx，加载追踪配置
         loadConfigsOfTypeFromProps(TracingConfig.class);
 
         // load multiple config types:
-        // load dubbo.protocols.xxx
+        // load dubbo.protocols.xxx，加载协议配置
         loadConfigsOfTypeFromProps(ProtocolConfig.class);
 
-        // load dubbo.registries.xxx
+        // load dubbo.registries.xxx，加载注册中心配置
         loadConfigsOfTypeFromProps(RegistryConfig.class);
 
-        // load dubbo.metadata-report.xxx
+        // load dubbo.metadata-report.xxx，加载元数据报告配置
         loadConfigsOfTypeFromProps(MetadataReportConfig.class);
 
         // config centers has been loaded before starting config center
         // loadConfigsOfTypeFromProps(ConfigCenterConfig.class);
 
+        // 刷新所有配置对象，使配置生效
         refreshAll();
 
+        // 检查配置的合法性和完整性
         checkConfigs();
 
-        // set model name
+        // set model name，设置应用模型名称
         if (StringUtils.isBlank(applicationModel.getModelName())) {
             applicationModel.setModelName(applicationModel.getApplicationName());
         }

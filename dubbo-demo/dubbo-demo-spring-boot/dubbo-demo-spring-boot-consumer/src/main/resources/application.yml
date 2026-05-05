@@ -2,6 +2,7 @@ dubbo:
   application:
     name: dubbo-sp-demo-consumer
     qos-enable: false
+#    scope: remote
     #FORCE_APPLICATION 应用级订阅
     # APPLICATION_FIRST (默认),既有接口应用订阅应用级订阅
 #    FORCE_INTERFACE 接口级订阅

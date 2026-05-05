@@ -62,10 +62,29 @@ public class ReferenceBeanManager implements ApplicationContextAware {
     private volatile boolean initialized = false;
     private ModuleModel moduleModel;
 
+    /**
+     * 添加ReferenceBean到管理器
+     * <p>
+     * 该方法负责将ReferenceBean注册到管理器中，并进行以下处理：
+     * 1. 验证ReferenceBean的ID不为空
+     * 2. 检查是否在DubboConfigBeanInitializer之前被提前初始化，如果是则记录警告
+     * 3. 生成或获取ReferenceBean的唯一标识key
+     * 4. 检测并阻止重复的ReferenceBean注册（相同ID但不同实例）
+     * 5. 将ReferenceBean保存到内部映射表中
+     * 6. 注册reference key与bean name的映射关系
+     * 7. 如果已经完成prepare阶段，则立即初始化该ReferenceBean
+     * <p>
+     * 注意：如果在BeanPostProcessor尚未加载时就调用此方法（提前初始化），
+     * 可能会导致某些组件（如Seata）工作异常。
+     *
+     * @param referenceBean 要添加的ReferenceBean对象
+     * @throws Exception 当发现重复的ReferenceBean或验证失败时抛出异常
+     */
     public void addReference(ReferenceBean referenceBean) throws Exception {
         String referenceBeanName = referenceBean.getId();
         Assert.notEmptyString(referenceBeanName, "The id of ReferenceBean cannot be empty");
 
+        // 检查是否提前初始化，此时BeanPostProcessor可能尚未加载
         if (!initialized) {
             // TODO add issue url to describe early initialization
             logger.warn(
@@ -77,10 +96,14 @@ public class ReferenceBeanManager implements ApplicationContextAware {
                             + referenceBeanName
                             + " = " + ReferenceBeanSupport.generateReferenceKey(referenceBean, applicationContext));
         }
+
+        // 生成或获取ReferenceBean的唯一标识key
         String referenceKey = getReferenceKeyByBeanName(referenceBeanName);
         if (StringUtils.isEmpty(referenceKey)) {
             referenceKey = ReferenceBeanSupport.generateReferenceKey(referenceBean, applicationContext);
         }
+
+        // 检查是否存在重复的ReferenceBean
         ReferenceBean oldReferenceBean = referenceBeanMap.get(referenceBeanName);
         if (oldReferenceBean != null) {
             if (referenceBean != oldReferenceBean) {
@@ -91,11 +114,15 @@ public class ReferenceBeanManager implements ApplicationContextAware {
             }
             return;
         }
+
+        // 保存ReferenceBean到映射表
         referenceBeanMap.put(referenceBeanName, referenceBean);
-        // save cache, map reference key to referenceBeanName
+
+        // save cache, map reference key to referenceBeanName，注册key与name的映射关系
         this.registerReferenceKeyAndBeanName(referenceKey, referenceBeanName);
 
         // if add reference after prepareReferenceBeans(), should init it immediately.
+        // 如果已经完成prepare阶段，立即初始化新添加的ReferenceBean
         if (initialized) {
             initReferenceBean(referenceBean);
         }
@@ -158,47 +185,63 @@ public class ReferenceBeanManager implements ApplicationContextAware {
     }
 
     /**
-     * NOTE: This method should only call after all dubbo config beans and all property resolvers is loaded.
+     * 初始化ReferenceBean，创建并关联ReferenceConfig
+     * <p>
+     * 该方法负责将ReferenceBean转换为真正的ReferenceConfig对象，并完成以下操作：
+     * 1. 检查ReferenceBean是否已经初始化（通过referenceConfig是否为null判断）
+     * 2. 生成或获取ReferenceBean的唯一标识key
+     * 3. 从ReferenceBean中提取属性，使用ReferenceCreator创建ReferenceConfig
+     * 4. 设置ReferenceConfig的ID（如果不是自动生成的名称）
+     * 5. 缓存ReferenceConfig到内部映射表
+     * 6. 将ReferenceConfig注册到ConfigManager
+     * 7. 设置ModuleDeployer状态为pending，触发模块重新评估部署状态
+     * 8. 将ReferenceConfig与ReferenceBean关联
+     * <p>
+     * 注意：该方法必须在所有Dubbo配置Bean和属性解析器加载完成后才能调用，
+     * 以确保能够正确解析配置中的占位符和引用。
      *
-     * @param referenceBean
-     * @throws Exception
+     * @param referenceBean 需要初始化的ReferenceBean对象
+     * @throws Exception 当初始化失败时抛出异常
      */
     public synchronized void initReferenceBean(ReferenceBean referenceBean) throws Exception {
 
+        // 如果ReferenceConfig已存在，说明已经初始化过，直接返回
         if (referenceBean.getReferenceConfig() != null) {
             return;
         }
 
         // TOTO check same unique service name but difference reference key (means difference attributes).
 
-        // reference key
+        // 生成或获取ReferenceBean的唯一标识key
         String referenceKey = getReferenceKeyByBeanName(referenceBean.getId());
         if (StringUtils.isEmpty(referenceKey)) {
             referenceKey = ReferenceBeanSupport.generateReferenceKey(referenceBean, applicationContext);
         }
 
+        // 查找是否已存在相同key的ReferenceConfig
         ReferenceConfig referenceConfig = referenceConfigMap.get(referenceKey);
         if (referenceConfig == null) {
-            // create real ReferenceConfig
+            // create real ReferenceConfig，从ReferenceBean提取属性并创建ReferenceConfig
             Map<String, Object> referenceAttributes = ReferenceBeanSupport.getReferenceAttributes(referenceBean);
             referenceConfig = ReferenceCreator.create(referenceAttributes, applicationContext)
                     .defaultInterfaceClass(referenceBean.getObjectType())
                     .build();
 
-            // set id if it is not a generated name
+            // set id if it is not a generated name，设置ReferenceConfig的ID
             if (referenceBean.getId() != null && !referenceBean.getId().contains("#")) {
                 referenceConfig.setId(referenceBean.getId());
             }
 
-            // cache referenceConfig
+            // cache referenceConfig，缓存ReferenceConfig
             referenceConfigMap.put(referenceKey, referenceConfig);
 
-            // register ReferenceConfig
+            // register ReferenceConfig，注册到ConfigManager并设置模块状态为pending
             moduleModel.getConfigManager().addReference(referenceConfig);
             moduleModel.getDeployer().setPending();
         }
 
-        // associate referenceConfig to referenceBean
+        // associate referenceConfig to referenceBean，将ReferenceConfig与ReferenceBean关联
         referenceBean.setKeyAndReferenceConfig(referenceKey, referenceConfig);
     }
+
 }

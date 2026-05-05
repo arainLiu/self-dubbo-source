@@ -207,6 +207,20 @@ public class ReferenceBean<T>
      * @see ReferenceBeanManager#initReferenceBean(ReferenceBean)
      * @see DubboBeanDefinitionParser#configReferenceBean
      */
+    /**
+     * 获取引用服务的代理对象
+     * <p>
+     * 该方法是Spring FactoryBean接口的实现，用于返回Dubbo服务的代理对象。
+     * 采用懒加载策略：
+     * 1. 首次调用时创建懒加载代理对象
+     * 2. 后续调用直接返回已创建的代理对象
+     * <p>
+     * 懒加载代理的设计使得服务引用在实际被使用时才真正初始化，
+     * 避免了启动时立即建立所有远程连接，提升了应用启动速度。
+     *
+     * @return 服务接口的代理对象
+     * @throws Exception 当创建代理对象失败时抛出异常
+     */
     @Override
     public T getObject() {
         if (lazyProxy == null) {
@@ -226,13 +240,33 @@ public class ReferenceBean<T>
         return true;
     }
 
+    /**
+     * 在Spring Bean属性设置完成后进行初始化
+     * <p>
+     * 该方法是Spring InitializingBean接口的实现，在Bean的所有属性设置完成后被调用。
+     * 主要执行以下初始化逻辑：
+     * 1. 获取BeanFactory和当前Bean的定义信息
+     * 2. 从Bean定义中提取接口类和接口名称（区分AOT模式和非AOT模式）
+     * 3. 根据不同的配置方式（@DubboReference注解、Java Config、XML）提取引用属性
+     * 4. 验证必要的属性（接口类、接口名称）已正确初始化
+     * 5. 获取ReferenceBeanManager并注册当前ReferenceBean
+     * <p>
+     * 该方法支持多种配置方式的兼容处理：
+     * - @DubboReference注解在Java Config类的@Bean方法上
+     * - @DubboReference注解在字段或setter方法上
+     * - XML配置的reference bean
+     *
+     * @throws Exception 当初始化失败时抛出异常
+     */
     @Override
     public void afterPropertiesSet() throws Exception {
         ConfigurableListableBeanFactory beanFactory = getBeanFactory();
 
-        // pre init xml reference bean or @DubboReference annotation
+        // 预初始化XML reference bean或@DubboReference注解配置，验证Bean ID不为空
         Assert.notEmptyString(getId(), "The id of ReferenceBean cannot be empty");
         BeanDefinition beanDefinition = beanFactory.getBeanDefinition(getId());
+
+        // 根据是否使用AOT模式，从不同位置获取接口类和接口名称
         if (AotWithSpringDetector.useGeneratedArtifacts()) {
             this.interfaceClass =
                     (Class<?>) beanDefinition.getPropertyValues().get(ReferenceAttributes.INTERFACE_CLASS);
@@ -244,6 +278,7 @@ public class ReferenceBean<T>
         }
         Assert.notNull(this.interfaceClass, "The interface class of ReferenceBean is not initialized");
 
+        // 根据不同的配置方式提取引用属性
         if (beanDefinition.hasAttribute(Constants.REFERENCE_PROPS)) {
             // @DubboReference annotation at java-config class @Bean method
             // @DubboReference annotation at reference field or setter method
@@ -259,16 +294,18 @@ public class ReferenceBean<T>
                     this.interfaceName = (String) referenceProps.get(ReferenceAttributes.INTERFACE);
                 }
             } else {
-                // xml reference bean
+                // xml reference bean，XML配置方式获取属性值
                 propertyValues = beanDefinition.getPropertyValues();
             }
         }
 
+        // 提取代理方式配置
         if (referenceProps != null) {
             this.proxy = (String) referenceProps.get(ReferenceAttributes.PROXY);
         }
         Assert.notNull(this.interfaceName, "The interface name of ReferenceBean is not initialized");
 
+        // 获取ReferenceBeanManager并注册当前ReferenceBean
         this.referenceBeanManager = beanFactory.getBean(ReferenceBeanManager.BEAN_NAME, ReferenceBeanManager.class);
         referenceBeanManager.addReference(this);
     }

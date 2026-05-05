@@ -717,24 +717,50 @@ public class ExtensionLoader<T> {
         }
     }
 
+    /**
+     * 获取自适应扩展实例
+     * <p>
+     * 该方法返回一个自适应扩展实例，该实例能够根据URL参数动态选择具体的扩展实现。
+     * 采用双重检查锁定（DCL）机制确保线程安全和单例特性：
+     * 1. 检查扩展加载器是否已销毁
+     * 2. 从缓存中获取自适应实例，如果存在则直接返回
+     * 3. 如果之前创建失败，则抛出缓存的异常
+     * 4. 使用同步锁保证并发场景下的安全性
+     * 5. 再次检查缓存，避免重复创建
+     * 6. 调用createAdaptiveExtension()创建自适应扩展实例并缓存
+     * 7. 如果创建失败，缓存异常信息以便后续快速失败
+     * <p>
+     * 自适应扩展是Dubbo SPI的核心特性之一，它允许在运行时根据URL中的参数
+     * 动态决定使用哪个扩展实现，提供了极大的灵活性。
+     *
+     * @return 自适应扩展实例
+     * @throws IllegalStateException 当扩展加载器已销毁或创建自适应实例失败时抛出
+     */
     @SuppressWarnings("unchecked")
     public T getAdaptiveExtension() {
+        // 检查扩展加载器是否已销毁
         checkDestroyed();
+
+        // 第一次检查缓存，无锁快速路径
         Object instance = cachedAdaptiveInstance.get();
         if (instance == null) {
+            // 如果之前创建失败，直接抛出缓存的异常
             if (createAdaptiveInstanceError != null) {
                 throw new IllegalStateException(
                         "Failed to create adaptive instance: " + createAdaptiveInstanceError.toString(),
                         createAdaptiveInstanceError);
             }
 
+            // 使用同步锁保证线程安全
             synchronized (cachedAdaptiveInstance) {
                 instance = cachedAdaptiveInstance.get();
                 if (instance == null) {
                     try {
+                        // 创建自适应扩展实例并缓存
                         instance = createAdaptiveExtension();
                         cachedAdaptiveInstance.set(instance);
                     } catch (Throwable t) {
+                        // 缓存异常信息，后续调用可以快速失败
                         createAdaptiveInstanceError = t;
                         throw new IllegalStateException("Failed to create adaptive instance: " + t.toString(), t);
                     }
