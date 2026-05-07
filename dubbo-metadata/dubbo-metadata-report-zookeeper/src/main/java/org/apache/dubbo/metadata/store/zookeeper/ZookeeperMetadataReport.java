@@ -136,9 +136,30 @@ public class ZookeeperMetadataReport extends AbstractMetadataReport {
         return toRootDir() + metadataIdentifier.getUniqueKey(KeyTypeEnum.PATH);
     }
 
+    /**
+     * 发布应用级别的元数据信息到ZooKeeper存储节点。
+     * <p>
+     * 该方法采用"首次创建"策略：只有当目标ZooKeeper节点不存在或内容为空，且待发布的元数据内容非空时，
+     * 才会创建或更新节点。这种设计确保了元数据的稳定性，避免频繁的覆盖操作，同时保证元数据一旦发布就不会被意外修改。
+     * </p>
+     * <p>
+     * 处理流程：
+     * <ol>
+     *   <li>根据SubscriberMetadataIdentifier生成ZooKeeper节点路径</li>
+     *   <li>检查节点当前内容是否为空，并且待发布的元数据内容是否非空</li>
+     *   <li>如果条件满足，调用zkClient.createOrUpdate()创建持久节点并写入元数据内容</li>
+     * </ol>
+     * </p>
+     *
+     * @param identifier 订阅者元数据标识符，包含应用名称、版本、分组等信息，用于生成唯一的存储路径
+     * @param metadataInfo 应用的完整元数据信息对象，包含所有服务接口的定义和配置
+     */
     @Override
     public void publishAppMetadata(SubscriberMetadataIdentifier identifier, MetadataInfo metadataInfo) {
         String path = getNodePath(identifier);
+        /*
+         * 仅在节点内容为空且待发布内容非空时才执行创建或更新操作，实现首次发布保护
+         */
         if (StringUtils.isBlank(zkClient.getContent(path)) && StringUtils.isNotEmpty(metadataInfo.getContent())) {
             zkClient.createOrUpdate(path, metadataInfo.getContent(), false);
         }

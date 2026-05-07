@@ -212,17 +212,66 @@ public abstract class AbstractAnnotationBeanPostProcessor
         return elements;
     }
 
+        /**
+     * 构建指定类的注解注入元数据，扫描并收集所有需要注入的字段和方法。
+     * <p>
+     * 该方法通过反射机制分析目标类的结构，提取两类注入点：
+     * <ul>
+     *   <li><b>字段注入</b>：调用findFieldAnnotationMetadata()查找所有标注了注入注解（如@Reference、@Autowired等）的字段</li>
+     *   <li><b>方法注入</b>：调用findAnnotatedMethodMetadata()查找所有标注了注入注解的方法（通常是setter方法）</li>
+     * </ul>
+     * 最终将收集到的字段元素和方法元素封装为AnnotatedInjectionMetadata对象，供后续的依赖注入流程使用。
+     * </p>
+     *
+     * @param beanClass 要分析的目标类，不能为null
+     * @return 包含所有注入点信息的AnnotatedInjectionMetadata对象
+     */
     private AbstractAnnotationBeanPostProcessor.AnnotatedInjectionMetadata buildAnnotatedMetadata(
             final Class<?> beanClass) {
+        /*
+         * 扫描类中所有标注了注入注解的字段，返回字段注入元素集合
+         */
         Collection<AbstractAnnotationBeanPostProcessor.AnnotatedFieldElement> fieldElements =
                 findFieldAnnotationMetadata(beanClass);
+        /*
+         * 扫描类中所有标注了注入注解的方法，返回方法注入元素集合
+         */
         Collection<AbstractAnnotationBeanPostProcessor.AnnotatedMethodElement> methodElements =
                 findAnnotatedMethodMetadata(beanClass);
+        /*
+         * 将字段和方法注入元素封装为完整的注入元数据对象
+         */
         return new AnnotatedInjectionMetadata(beanClass, fieldElements, methodElements);
     }
 
+
+        /**
+     * 查找或构建指定类的注解注入元数据，使用缓存机制提升性能并保证线程安全。
+     * <p>
+     * 该方法采用双重检查锁定（Double-Check Locking）模式，在高并发场景下减少不必要的同步开销。
+     * 主要执行以下操作：
+     * <ol>
+     *   <li>生成缓存键：优先使用beanName，如果为空则使用类的全限定名，保持与自定义调用者的向后兼容性</li>
+     *   <li>首次检查：从injectionMetadataCache中快速获取元数据，如果不需要刷新则直接返回</li>
+     *   <li>如果需要刷新（元数据为null或类信息已变更），进入同步块进行二次检查</li>
+     *   <li>在同步块内再次检查是否需要刷新，避免重复构建元数据</li>
+     *   <li>如果旧的元数据存在，先调用clear()清理之前的属性值</li>
+     *   <li>调用buildAnnotatedMetadata()构建新的注解注入元数据并存入缓存</li>
+     *   <li>捕获NoClassDefFoundError并转换为IllegalStateException，提供更清晰的错误信息</li>
+     * </ol>
+     * </p>
+     *
+     * @param beanName Spring Bean的名称，可能为空
+     * @param clazz 要查找注入元数据的目标类
+     * @param pvs 属性值对象，用于清理旧的注入元数据中的属性引用
+     * @return 注解注入元数据对象，包含所有需要注入的字段和方法信息
+     * @throws IllegalStateException 当找不到类依赖的其他类时抛出
+     */
     protected AnnotatedInjectionMetadata findInjectionMetadata(String beanName, Class<?> clazz, PropertyValues pvs) {
         // Fall back to class name as cache key, for backwards compatibility with custom callers.
+        /*
+         * 生成缓存键：优先使用beanName，为空时使用类名作为降级方案
+         */
         String cacheKey = (StringUtils.hasLength(beanName) ? beanName : clazz.getName());
         // Quick check on the concurrent map first, with minimal locking.
         AbstractAnnotationBeanPostProcessor.AnnotatedInjectionMetadata metadata =
@@ -232,10 +281,16 @@ public abstract class AbstractAnnotationBeanPostProcessor
                 metadata = this.injectionMetadataCache.get(cacheKey);
 
                 if (needsRefreshInjectionMetadata(metadata, clazz)) {
+                    /*
+                     * 清理旧元数据中的属性引用，避免内存泄漏
+                     */
                     if (metadata != null) {
                         metadata.clear(pvs);
                     }
                     try {
+                        /*
+                         * 构建新的注解注入元数据并放入缓存
+                         */
                         metadata = buildAnnotatedMetadata(clazz);
                         this.injectionMetadataCache.put(cacheKey, metadata);
                     } catch (NoClassDefFoundError err) {
@@ -249,6 +304,7 @@ public abstract class AbstractAnnotationBeanPostProcessor
         }
         return metadata;
     }
+
 
     // Use custom check method to compatible with Spring 4.x
     private boolean needsRefreshInjectionMetadata(AnnotatedInjectionMetadata metadata, Class<?> clazz) {

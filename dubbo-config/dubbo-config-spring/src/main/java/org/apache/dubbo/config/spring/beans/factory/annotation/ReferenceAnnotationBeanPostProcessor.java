@@ -190,6 +190,7 @@ public class ReferenceAnnotationBeanPostProcessor extends AbstractAnnotationBean
                 beanType = beanFactory.getType(beanName);
             }
             if (beanType != null) {
+                // 查找注入元数据
                 AnnotatedInjectionMetadata metadata = findInjectionMetadata(beanName, beanType, null);
                 try {
                     /*

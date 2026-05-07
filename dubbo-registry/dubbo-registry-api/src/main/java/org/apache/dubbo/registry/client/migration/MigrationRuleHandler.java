@@ -190,6 +190,7 @@ public class MigrationRuleHandler<T> {
                 setCurrentStepAndThreshold(step, threshold);
                 logger.info(
                         "Succeed Migrated to " + step + " mode. Service Name: " + consumerURL.getDisplayServiceKey());
+                //上报状态信息到监控中心
                 report(step, originStep, "true");
             } else {
                 /*
@@ -216,10 +217,32 @@ public class MigrationRuleHandler<T> {
         return true;
     }
 
+    /**
+     * 上报服务迁移步骤的状态信息到监控系统，用于追踪迁移过程和诊断问题。
+     * <p>
+     * 该方法从应用模型中获取FrameworkStatusReportService，如果存在已注册的报告器，
+     * 则创建迁移步骤报告并上报。报告内容包含服务标识信息（接口名、版本、分组）、
+     * 迁移的起始状态、目标状态以及执行结果（成功/失败）。
+     * </p>
+     * <p>
+     * 典型使用场景：
+     * <ul>
+     *   <li>迁移步骤执行成功后，上报success="true"记录成功的迁移路径</li>
+     *   <li>迁移步骤执行失败后，上报success="false"记录失败的迁移尝试</li>
+     * </ul>
+     * </p>
+     *
+     * @param step 迁移后的目标步骤，表示当前期望达到的迁移状态
+     * @param originStep 迁移前的原始步骤，表示迁移开始时的状态
+     * @param success 迁移执行结果，通常为"true"或"false"字符串
+     */
     private void report(MigrationStep step, MigrationStep originStep, String success) {
         FrameworkStatusReportService reportService =
                 consumerURL.getOrDefaultApplicationModel().getBeanFactory().getBean(FrameworkStatusReportService.class);
 
+        /*
+         * 如果存在报告器，则创建并上报迁移步骤状态报告
+         */
         if (reportService.hasReporter()) {
             reportService.reportMigrationStepStatus(reportService.createMigrationStepReport(
                     consumerURL.getServiceInterface(),

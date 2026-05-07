@@ -46,13 +46,38 @@ public class AdaptiveLoadBalance extends AbstractLoadBalance {
         adaptiveMetrics = scopeModel.getBeanFactory().getBean(AdaptiveMetrics.class);
     }
 
+    /**
+     * 基于P2C（Power of Two Choices）算法选择服务提供者，并记录自适应负载均衡相关的监控指标。
+     * <p>
+     * 该方法是自适应负载均衡的核心选择逻辑，首先通过P2C算法从候选列表中挑选出两个随机节点并对比其负载状态，
+     * 选择较优的一个作为目标Invoker。随后，它会将选择结果、开始时间等上下文信息存入Invocation对象，
+     * 以便在调用结束后计算耗时并更新自适应度量数据（如RTT、成功率等）。
+     * </p>
+     *
+     * @param invokers 待选择的Invoker列表，包含所有可用的服务提供者
+     * @param url 消费者URL，包含负载均衡配置和服务元数据
+     * @param invocation RPC调用上下文，用于存储附件信息和属性，支持跨链路传递负载状态
+     * @return 经过P2C算法选出的最优Invoker对象
+     */
     @Override
     protected <T> Invoker<T> doSelect(List<Invoker<T>> invokers, URL url, Invocation invocation) {
+        /*
+         * 执行P2C算法进行节点选择
+         */
         Invoker<T> invoker = selectByP2C(invokers, invocation);
+        /*
+         * 将Attachment Key写入调用上下文，用于后续链路追踪或状态同步
+         */
         invocation.setAttachment(Constants.ADAPTIVE_LOADBALANCE_ATTACHMENT_KEY, attachmentKey);
         long startTime = System.currentTimeMillis();
+        /*
+         * 记录选择完成的起始时间和负载均衡类型，供调用结束后的指标统计使用
+         */
         invocation.getAttributes().put(Constants.ADAPTIVE_LOADBALANCE_START_TIME, startTime);
         invocation.getAttributes().put(LOADBALANCE_KEY, LoadbalanceRules.ADAPTIVE);
+        /*
+         * 上报请求计数和节点选取时间到自适应监控组件
+         */
         adaptiveMetrics.addConsumerReq(getServiceKey(invoker, invocation));
         adaptiveMetrics.setPickTime(getServiceKey(invoker, invocation), startTime);
 

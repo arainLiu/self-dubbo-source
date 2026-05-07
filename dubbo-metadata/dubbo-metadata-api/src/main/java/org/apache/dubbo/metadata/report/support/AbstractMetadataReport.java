@@ -244,6 +244,38 @@ public abstract class AbstractMetadataReport implements MetadataReport {
         }
     }
 
+    /**
+     * 保存元数据到本地属性文件缓存，支持同步和异步两种写入模式。
+     * <p>
+     * 该方法负责将元数据更新到内存中的Properties对象，并根据sync参数决定是立即同步写入磁盘还是异步批量写入。
+     * 采用版本号机制（lastCacheChanged）追踪缓存变更，确保SaveProperties任务能够检测到数据变化并执行持久化操作。
+     * </p>
+     * <p>
+     * 处理流程：
+     * <ol>
+     *   <li>检查是否配置了本地缓存文件（file字段），如果未配置则直接返回，不执行任何操作</li>
+     *   <li>根据add参数决定操作类型：
+     *     <ul>
+     *       <li>add=true：将元数据键值对添加到Properties中，键为metadataIdentifier的唯一标识，值为序列化后的元数据</li>
+     *       <li>add=false：从Properties中移除该元数据键值对，用于清理过期数据</li>
+     *     </ul>
+     *   </li>
+     *   <li>递增lastCacheChanged版本号，生成新的版本标识</li>
+     *   <li>根据sync参数选择执行方式：
+     *     <ul>
+     *       <li>sync=true：在当前线程直接执行SaveProperties任务，同步写入磁盘</li>
+     *       <li>sync=false：将SaveProperties任务提交到reportCacheExecutor线程池异步执行</li>
+     *     </ul>
+     *   </li>
+     *   <li>捕获所有Throwable异常并记录警告日志，确保单个元数据的保存失败不影响其他操作</li>
+     * </ol>
+     * </p>
+     *
+     * @param metadataIdentifier 元数据的唯一标识符，包含服务接口、版本、分组等信息
+     * @param value 序列化后的元数据内容（通常为JSON字符串）
+     * @param add 标识是添加还是删除操作，true表示添加/更新，false表示删除
+     * @param sync 标识是否同步执行，true表示立即写入磁盘，false表示异步批量写入
+     */
     private void saveProperties(MetadataIdentifier metadataIdentifier, String value, boolean add, boolean sync) {
         if (file == null) {
             return;
@@ -255,10 +287,19 @@ public abstract class AbstractMetadataReport implements MetadataReport {
             } else {
                 properties.remove(metadataIdentifier.getUniqueKey(KeyTypeEnum.UNIQUE_KEY));
             }
+            /*
+             * 递增缓存变更版本号，触发持久化任务
+             */
             long version = lastCacheChanged.incrementAndGet();
             if (sync) {
+                /*
+                 * 同步模式：在当前线程立即执行保存操作
+                 */
                 new SaveProperties(version).run();
             } else {
+                /*
+                 * 异步模式：提交到线程池批量执行保存操作
+                 */
                 reportCacheExecutor.execute(new SaveProperties(version));
             }
 
@@ -343,6 +384,35 @@ public abstract class AbstractMetadataReport implements MetadataReport {
         }
     }
 
+    /**
+     * 执行消费者元数据的存储任务，支持失败重试机制。
+     * <p>
+     * 该方法负责将消费者的元数据信息（如服务接口、版本、分组、配置参数等）持久化到元数据存储中心。
+     * 采用"先成功后清理"的策略：先将元数据存入allMetadataReports缓存，然后尝试持久化，如果成功则从failedReports中移除，
+     * 如果失败则加入failedReports并触发重试任务。
+     * </p>
+     * <p>
+     * 处理流程：
+     * <ol>
+     *   <li>记录INFO级别的日志，输出即将存储的消费者元数据标识和定义内容</li>
+     *   <li>将元数据放入allMetadataReports全量缓存中，用于后续查询和管理</li>
+     *   <li>从failedReports失败缓存中移除该标识，假设本次操作可能成功</li>
+     *   <li>将serviceParameterMap序列化为JSON字符串</li>
+     *   <li>调用doStoreConsumerMetadata()模板方法执行具体的持久化操作（由子类实现，如Zookeeper、Nacos等）</li>
+     *   <li>调用saveProperties()保存元数据到本地属性文件，根据syncReport参数决定是同步还是异步执行</li>
+     *   <li>如果任何步骤发生异常：
+     *     <ul>
+     *       <li>将元数据重新放入failedReports失败缓存</li>
+     *       <li>调用metadataReportRetry.startRetryTask()启动或唤醒重试任务，定期重试失败的存储操作</li>
+     *       <li>记录ERROR级别的日志，包含完整的错误堆栈信息</li>
+     *     </ul>
+     *   </li>
+     * </ol>
+     * </p>
+     *
+     * @param consumerMetadataIdentifier 消费者元数据的唯一标识符，包含服务接口、版本、分组、应用名称等信息
+     * @param serviceParameterMap 消费者的配置参数映射表，包含超时时间、重试次数、负载均衡策略等配置项
+     */
     protected void storeConsumerMetadataTask(
             MetadataIdentifier consumerMetadataIdentifier, Map<String, String> serviceParameterMap) {
         try {
@@ -350,14 +420,29 @@ public abstract class AbstractMetadataReport implements MetadataReport {
                 logger.info("[METADATA_REGISTER] store consumer metadata. Identifier : " + consumerMetadataIdentifier
                         + "; definition: " + serviceParameterMap);
             }
+            /*
+             * 将元数据存入全量缓存，并从失败缓存中移除（假设本次可能成功）
+             */
             allMetadataReports.put(consumerMetadataIdentifier, serviceParameterMap);
             failedReports.remove(consumerMetadataIdentifier);
 
+            /*
+             * 序列化参数Map为JSON格式
+             */
             String data = JsonUtils.toJson(serviceParameterMap);
+            /*
+             * 调用子类实现的模板方法执行具体的持久化操作
+             */
             doStoreConsumerMetadata(consumerMetadataIdentifier, data);
+            /*
+             * 保存元数据到本地属性文件，根据syncReport参数决定同步或异步执行
+             */
             saveProperties(consumerMetadataIdentifier, data, true, !syncReport);
         } catch (Exception e) {
             // retry again. If failed again, throw exception.
+            /*
+             * 存储失败时，将元数据加入失败缓存并触发重试任务
+             */
             failedReports.put(consumerMetadataIdentifier, serviceParameterMap);
             metadataReportRetry.startRetryTask();
             logger.error(
@@ -509,6 +594,25 @@ public abstract class AbstractMetadataReport implements MetadataReport {
             this.retryLimit = retryTimes;
         }
 
+        /**
+         * 启动元数据报告的定时重试任务，采用双重检查锁定保证任务只被调度一次。
+         * <p>
+         * 该方法在元数据存储失败时被调用，用于启动后台重试线程定期尝试重新提交失败的元数据报告。
+         * 使用scheduleWithFixedDelay()创建固定延迟的周期性任务，无论前一次执行耗时多久，
+         * 两次执行之间都会间隔固定的retryPeriod时间。
+         * </p>
+         * <p>
+         * 重试任务的终止条件（满足任一即停止）：
+         * <ul>
+         *   <li><b>成功且超过最小重试次数</b>：retry()返回true（所有失败报告重传成功）且当前重试次数大于retryTimesIfNonFail</li>
+         *   <li><b>超过最大重试次数限制</b>：当前重试次数大于retryLimit，防止无限重试消耗资源</li>
+         * </ul>
+         * </p>
+         * <p>
+         * 线程安全：通过synchronized(retryCounter)和双重检查锁定模式，确保在并发场景下只会创建一个重试任务，
+         * 避免重复调度导致的资源浪费。
+         * </p>
+         */
         void startRetryTask() {
             if (retryScheduledFuture == null) {
                 synchronized (retryCounter) {
@@ -517,11 +621,20 @@ public abstract class AbstractMetadataReport implements MetadataReport {
                                 () -> {
                                     // Check and connect to the metadata
                                     try {
+                                        /*
+                                         * 递增重试计数器并记录日志
+                                         */
                                         int times = retryCounter.incrementAndGet();
                                         logger.info("start to retry task for metadata report. retry times:" + times);
+                                        /*
+                                         * 如果重试成功且超过最小重试次数，则取消任务
+                                         */
                                         if (retry() && times > retryTimesIfNonFail) {
                                             cancelRetryTask();
                                         }
+                                        /*
+                                         * 如果超过最大重试次数限制，强制取消任务
+                                         */
                                         if (times > retryLimit) {
                                             cancelRetryTask();
                                         }

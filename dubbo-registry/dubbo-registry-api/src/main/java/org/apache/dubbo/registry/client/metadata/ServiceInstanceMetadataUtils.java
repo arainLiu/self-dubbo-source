@@ -267,6 +267,29 @@ public class ServiceInstanceMetadataUtils {
         });
     }
 
+    /**
+     * 应用所有服务实例定制器，对服务实例进行自定义扩展处理。
+     * <p>
+     * 该方法通过SPI机制加载所有已注册的{@link ServiceInstanceCustomizer}实现，并依次调用其customize()方法，
+     * 允许开发者在不修改核心代码的情况下为服务实例添加额外的属性、标签或元数据信息。
+     * 这种设计遵循开闭原则，支持通过插件化方式扩展服务实例的功能。
+     * </p>
+     * <p>
+     * 典型使用场景包括：
+     * <ul>
+     *   <li>添加自定义的实例标签（如机房标识、环境标识等）</li>
+     *   <li>设置额外的元数据键值对（如版本号、权重等）</li>
+     *   <li>根据业务需求修改实例的网络地址或端口信息</li>
+     * </ul>
+     * </p>
+     * <p>
+     * 注意：当前实现中未对定制器进行排序（见FIXME注释），定制器的执行顺序取决于SPI加载的顺序，
+     * 如果多个定制器之间存在依赖关系，可能会导致不确定的行为。
+     * </p>
+     *
+     * @param instance 要定制的服务实例对象，定制器会直接修改该实例的属性
+     * @param applicationModel 应用模型，提供定制器执行所需的上下文信息和配置
+     */
     public static void customizeInstance(ServiceInstance instance, ApplicationModel applicationModel) {
         ExtensionLoader<ServiceInstanceCustomizer> loader =
                 instance.getOrDefaultApplicationModel().getExtensionLoader(ServiceInstanceCustomizer.class);

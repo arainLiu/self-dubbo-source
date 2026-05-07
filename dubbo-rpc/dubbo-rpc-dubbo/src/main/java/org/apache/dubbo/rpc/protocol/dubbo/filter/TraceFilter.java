@@ -72,27 +72,45 @@ public class TraceFilter implements Filter {
         }
     }
 
+    /**
+     * 执行服务调用并跟踪调用详情，将结果实时推送至已订阅的监控通道
+     * 记录调用耗时、参数及返回值，并根据配置的最大跟踪次数自动管理跟踪通道
+     *
+     * @param invoker 服务调用器，用于获取接口名称及执行实际调用
+     * @param invocation 调用上下文对象，包含方法名、参数等信息
+     * @return RPC调用结果
+     * @throws RpcException 当RPC调用过程中发生异常时抛出
+     */
     @Override
     public Result invoke(Invoker<?> invoker, Invocation invocation) throws RpcException {
+        // 记录调用开始时间并执行实际的RPC调用
         long start = System.currentTimeMillis();
         Result result = invoker.invoke(invocation);
         long end = System.currentTimeMillis();
+
+        // 如果存在活跃的跟踪通道，则执行跟踪逻辑
         if (TRACERS.size() > 0) {
+            // 优先按“类名.方法名”匹配跟踪通道，若无则降级按“类名”匹配
             String key = invoker.getInterface().getName() + "." + RpcUtils.getMethodName(invocation);
             Set<Channel> channels = TRACERS.get(key);
             if (CollectionUtils.isEmpty(channels)) {
                 key = invoker.getInterface().getName();
                 channels = TRACERS.get(key);
             }
+
+            // 遍历所有匹配的通道，发送跟踪信息
             if (CollectionUtils.isNotEmpty(channels)) {
                 for (Channel channel : new ArrayList<>(channels)) {
                     if (channel.isConnected()) {
                         try {
+                            // 获取该通道允许跟踪的最大次数，默认为1次
                             int max = 1;
                             Integer m = (Integer) channel.getAttribute(TRACE_MAX);
                             if (m != null) {
                                 max = m;
                             }
+
+                            // 获取或初始化当前通道的已跟踪计数
                             int count;
                             AtomicInteger c = (AtomicInteger) channel.getAttribute(TRACE_COUNT);
                             if (c == null) {
@@ -100,6 +118,8 @@ public class TraceFilter implements Filter {
                                 channel.setAttribute(TRACE_COUNT, c);
                             }
                             count = c.getAndIncrement();
+
+                            // 如果未达到最大跟踪次数，则向通道发送详细的调用跟踪信息
                             if (count < max) {
                                 String prompt =
                                         channel.getUrl().getParameter(Constants.PROMPT_KEY, Constants.DEFAULT_PROMPT);
@@ -112,14 +132,18 @@ public class TraceFilter implements Filter {
                                                 + "\r\nelapsed: " + (end - start) + " ms."
                                                 + "\r\n\r\n" + prompt);
                             }
+
+                            // 如果已达到最大跟踪次数，则从跟踪列表中移除该通道
                             if (count >= max - 1) {
                                 channels.remove(channel);
                             }
                         } catch (Throwable e) {
+                            // 发生异常时移除通道并记录警告日志
                             channels.remove(channel);
                             logger.warn(PROTOCOL_FAILED_PARSE, "", "", e.getMessage(), e);
                         }
                     } else {
+                        // 如果通道已断开连接，则直接移除
                         channels.remove(channel);
                     }
                 }

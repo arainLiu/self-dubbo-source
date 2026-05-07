@@ -139,34 +139,123 @@ public class MigrationInvoker<T> implements MigrationClusterInvoker<T> {
         return type;
     }
 
+    /**
+     * 重新订阅服务并刷新Invoker，支持应用级和服务发现两种调用模式的同步更新。
+     * <p>
+     * 该方法用于在服务配置变更或服务迁移场景下，立即更新订阅URL并重新建立服务引用。
+     * 主要执行以下操作：
+     * <ol>
+     *   <li>将新的订阅参数序列化后添加到当前URL的REFER_KEY属性中，为后续的迁移刷新做准备</li>
+     *   <li>检查接口级调用的invoker是否存活，如果未销毁则调用doReSubscribe()重新订阅</li>
+     *   <li>检查应用级调用的serviceDiscoveryInvoker是否存活，如果未销毁则调用doReSubscribe()重新订阅</li>
+     * </ol>
+     * </p>
+     * <p>
+     * 这种双路刷新机制确保了在Dubbo3的服务迁移过程中，无论是使用传统的接口级注册发现还是新的应用级注册发现，
+     * 都能同步获取最新的服务配置和地址信息，保证调用链路的实时性和一致性。
+     * </p>
+     *
+     * @param newSubscribeUrl 新的订阅URL，包含更新后的服务参数、路由规则、负载均衡策略等配置
+     */
     @Override
     public void reRefer(URL newSubscribeUrl) {
         // update url to prepare for migration refresh
+        /*
+         * 更新当前URL中的订阅参数，为后续的迁移刷新做准备
+         */
         this.url = url.addParameter(REFER_KEY, StringUtils.toQueryString(newSubscribeUrl.getParameters()));
 
         // re-subscribe immediately
+        /*
+         * 重新订阅接口级调用的Invoker（基于传统注册中心模式）
+         */
         if (invoker != null && !invoker.isDestroyed()) {
             doReSubscribe(invoker, newSubscribeUrl);
         }
+        /*
+         * 重新订阅应用级调用的Invoker（基于服务发现模式）
+         */
         if (serviceDiscoveryInvoker != null && !serviceDiscoveryInvoker.isDestroyed()) {
             doReSubscribe(serviceDiscoveryInvoker, newSubscribeUrl);
         }
     }
 
+
+    /**
+     * 执行服务重新订阅操作，注销旧的消费者URL并注册新的URL，同时更新路由链和订阅关系。
+     * <p>
+     * 该方法用于在服务配置变更时刷新服务发现关系，确保消费者能够根据最新的配置获取服务提供者列表。
+     * 主要执行以下操作：
+     * <ol>
+     *   <li>从invoker中获取DynamicDirectory对象，提取旧的已注册消费者URL和Registry实例</li>
+     *   <li>调用registry.unregister()从注册中心注销旧的消费者URL</li>
+     *   <li>调用directory.unSubscribe()取消对旧URL的订阅，停止接收旧配置的服务提供者通知</li>
+     *   <li>如果directory配置了需要注册（shouldRegister=true），则：
+     *     <ul>
+     *       <li>调用registry.register()将新的消费者URL注册到注册中心</li>
+     *       <li>更新directory中保存的已注册消费者URL引用</li>
+     *     </ul>
+     *   </li>
+     *   <li>调用directory.buildRouterChain()基于新的URL构建路由链，应用最新的路由规则</li>
+     *   <li>调用directory.subscribe()订阅新的URL，开始接收新配置的服务提供者通知</li>
+     * </ol>
+     * </p>
+     *
+     * @param invoker 集群Invoker对象，包含Directory、Registry等核心组件引用
+     * @param newSubscribeUrl 新的订阅URL，包含更新后的服务参数和配置信息
+     */
     private void doReSubscribe(ClusterInvoker<T> invoker, URL newSubscribeUrl) {
         DynamicDirectory<T> directory = (DynamicDirectory<T>) invoker.getDirectory();
         URL oldSubscribeUrl = directory.getRegisteredConsumerUrl();
         Registry registry = directory.getRegistry();
+        /*
+         * 注销旧的消费者URL并取消订阅
+         */
         registry.unregister(directory.getRegisteredConsumerUrl());
         directory.unSubscribe(RegistryProtocol.toSubscribeUrl(oldSubscribeUrl));
         if (directory.isShouldRegister()) {
+            /*
+             * 注册新的消费者URL并更新directory中的引用
+             */
             registry.register(directory.getRegisteredConsumerUrl());
             directory.setRegisteredConsumerUrl(newSubscribeUrl);
         }
+        /*
+         * 基于新的URL重建路由链并重新订阅
+         */
         directory.buildRouterChain(newSubscribeUrl);
         directory.subscribe(RegistryProtocol.toSubscribeUrl(newSubscribeUrl));
     }
 
+
+    /**
+     * 强制迁移到接口级调用Invoker，根据迁移规则和地址可用性判断是否执行迁移。
+     * <p>
+     * 该方法用于在Dubbo3服务迁移过程中，从应用级调用（ServiceDiscoveryInvoker）回退或切换到传统的接口级调用（Invoker）。
+     * 主要执行以下操作：
+     * <ol>
+     *   <li>创建CountDownLatch并调用refreshInterfaceInvoker()异步刷新接口级Invoker的地址列表</li>
+     *   <li>如果serviceDiscoveryInvoker不存在，说明没有应用级调用器，直接将currentAvailableInvoker设置为invoker并返回成功</li>
+     *   <li>调用waitAddressNotify()等待地址通知完成，并根据新规则中的阈值进行初步判断</li>
+     *   <li>如果迁移规则配置了force=true，则强制迁移到接口级Invoker，销毁serviceDiscoveryInvoker并返回成功</li>
+     *   <li>否则，加载所有MigrationAddressComparator扩展，检查是否所有比较器都同意迁移（基于地址数量、成功率等指标）</li>
+     *   <li>如果所有比较器都通过，则将currentAvailableInvoker切换到invoker，销毁serviceDiscoveryInvoker并返回成功</li>
+     *   <li>如果比较失败且当前状态是FORCE_APPLICATION（强制应用级），则销毁接口级Invoker以保持状态一致性，返回失败</li>
+     * </ol>
+     * </p>
+     * <p>
+     * 迁移决策流程：
+     * <ul>
+     *   <li>无应用级Invoker → 直接迁移</li>
+     *   <li>force=true → 强制迁移</li>
+     *   <li>所有地址比较器通过 → 满足阈值条件后迁移</li>
+     *   <li>其他情况 → 保持当前状态不变</li>
+     * </ul>
+     * </p>
+     *
+     * @param newRule 新的迁移规则，包含force标志、threshold阈值、delay延迟时间等配置参数
+     * @return 如果成功迁移到接口级Invoker则返回true，否则返回false并保持当前状态
+     */
     @Override
     public boolean migrateToForceInterfaceInvoker(MigrationRule newRule) {
         CountDownLatch latch = new CountDownLatch(1);
@@ -179,15 +268,24 @@ public class MigrationInvoker<T> implements MigrationClusterInvoker<T> {
         }
 
         // wait and compare threshold
+        /*
+         * 等待地址通知完成，并根据规则中的阈值进行初步判断
+         */
         waitAddressNotify(newRule, latch);
 
         if (newRule.getForce(consumerUrl)) {
             // force migrate, ignore threshold check
+            /*
+             * 强制迁移场景：直接切换到接口级Invoker并销毁应用级Invoker
+             */
             this.currentAvailableInvoker = invoker;
             this.destroyServiceDiscoveryInvoker();
             return true;
         }
 
+        /*
+         * 加载所有地址比较器，检查是否满足迁移条件
+         */
         Set<MigrationAddressComparator> detectors = ScopeModelUtil.getApplicationModel(
                         consumerUrl == null ? null : consumerUrl.getScopeModel())
                 .getExtensionLoader(MigrationAddressComparator.class)
@@ -202,12 +300,44 @@ public class MigrationInvoker<T> implements MigrationClusterInvoker<T> {
         }
 
         // compare failed, will not change state
+        /*
+         * 迁移条件不满足时，如果当前处于FORCE_APPLICATION状态，则清理接口级Invoker以保持一致性
+         */
         if (step == MigrationStep.FORCE_APPLICATION) {
             destroyInterfaceInvoker();
         }
         return false;
     }
 
+
+    /**
+     * 强制迁移到应用级调用Invoker，根据迁移规则和地址可用性判断是否执行迁移。
+     * <p>
+     * 该方法用于在Dubbo3服务迁移过程中，从传统的接口级调用（Invoker）切换到新的应用级调用（ServiceDiscoveryInvoker）。
+     * 这是服务迁移的核心逻辑，支持平滑过渡和灰度发布。主要执行以下操作：
+     * <ol>
+     *   <li>创建CountDownLatch并调用refreshServiceDiscoveryInvoker()异步刷新应用级Invoker的地址列表</li>
+     *   <li>如果invoker不存在，说明没有接口级调用器，直接将currentAvailableInvoker设置为serviceDiscoveryInvoker并返回成功</li>
+     *   <li>调用waitAddressNotify()等待地址通知完成，并根据新规则中的阈值进行初步判断</li>
+     *   <li>如果迁移规则配置了force=true，则强制迁移到应用级Invoker，销毁invoker并返回成功</li>
+     *   <li>否则，加载所有MigrationAddressComparator扩展，检查是否所有比较器都同意迁移（基于地址数量、成功率等指标）</li>
+     *   <li>如果所有比较器都通过，则将currentAvailableInvoker切换到serviceDiscoveryInvoker，销毁invoker并返回成功</li>
+     *   <li>如果比较失败且当前状态是FORCE_INTERFACE（强制接口级），则销毁应用级Invoker以保持状态一致性，返回失败</li>
+     * </ol>
+     * </p>
+     * <p>
+     * 迁移决策流程：
+     * <ul>
+     *   <li>无接口级Invoker → 直接迁移到应用级</li>
+     *   <li>force=true → 强制迁移到应用级</li>
+     *   <li>所有地址比较器通过 → 满足阈值条件后迁移到应用级</li>
+     *   <li>其他情况 → 保持当前状态不变</li>
+     * </ul>
+     * </p>
+     *
+     * @param newRule 新的迁移规则，包含force标志、threshold阈值、delay延迟时间等配置参数
+     * @return 如果成功迁移到应用级Invoker则返回true，否则返回false并保持当前状态
+     */
     @Override
     public boolean migrateToForceApplicationInvoker(MigrationRule newRule) {
         CountDownLatch latch = new CountDownLatch(1);
@@ -220,15 +350,24 @@ public class MigrationInvoker<T> implements MigrationClusterInvoker<T> {
         }
 
         // wait and compare threshold
+        /*
+         * 等待地址通知完成，并根据规则中的阈值进行初步判断
+         */
         waitAddressNotify(newRule, latch);
 
         if (newRule.getForce(consumerUrl)) {
             // force migrate, ignore threshold check
+            /*
+             * 强制迁移场景：直接切换到应用级Invoker并销毁接口级Invoker
+             */
             this.currentAvailableInvoker = serviceDiscoveryInvoker;
             this.destroyInterfaceInvoker();
             return true;
         }
 
+        /*
+         * 加载所有地址比较器，检查是否满足迁移条件
+         */
         Set<MigrationAddressComparator> detectors = ScopeModelUtil.getApplicationModel(
                         consumerUrl == null ? null : consumerUrl.getScopeModel())
                 .getExtensionLoader(MigrationAddressComparator.class)
@@ -243,6 +382,9 @@ public class MigrationInvoker<T> implements MigrationClusterInvoker<T> {
         }
 
         // compare failed, will not change state
+        /*
+         * 迁移条件不满足时，如果当前处于FORCE_INTERFACE状态，则清理应用级Invoker以保持一致性
+         */
         if (step == MigrationStep.FORCE_INTERFACE) {
             destroyServiceDiscoveryInvoker();
         }

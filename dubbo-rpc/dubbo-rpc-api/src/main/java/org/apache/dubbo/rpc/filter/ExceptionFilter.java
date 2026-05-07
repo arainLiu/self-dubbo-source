@@ -55,17 +55,27 @@ public class ExceptionFilter implements Filter, Filter.Listener {
         return invoker.invoke(invocation);
     }
 
+    /**
+     * 处理服务端响应中的异常，根据异常类型决定是否包装为RuntimeException
+     * 目的是避免将非预期的检查型异常或第三方库异常直接抛给客户端，导致客户端反序列化失败
+     *
+     * @param appResponse RPC调用的应用层响应结果，可能包含异常信息
+     * @param invoker 调用器对象，用于获取服务接口类型和URL信息
+     * @param invocation 调用上下文对象，包含方法名和参数类型等信息
+     */
     @Override
     public void onResponse(Result appResponse, Invoker<?> invoker, Invocation invocation) {
+        // 仅当响应中存在异常且目标服务不是GenericService时执行过滤逻辑
         if (appResponse.hasException() && GenericService.class != invoker.getInterface()) {
             try {
                 Throwable exception = appResponse.getException();
 
-                // directly throw if it's checked exception
+                // 如果是检查型异常（非RuntimeException），则直接返回，允许其传递给客户端
                 if (!(exception instanceof RuntimeException) && (exception instanceof Exception)) {
                     return;
                 }
-                // directly throw if the exception appears in the signature
+
+                // 如果异常已在方法签名的throws子句中声明，则直接返回
                 try {
                     Method method = invoker.getInterface()
                             .getMethod(RpcUtils.getMethodName(invocation), invocation.getParameterTypes());
@@ -76,10 +86,11 @@ public class ExceptionFilter implements Filter, Filter.Listener {
                         }
                     }
                 } catch (NoSuchMethodException e) {
+                    // 如果找不到对应的方法，则跳过过滤逻辑
                     return;
                 }
 
-                // for the exception not found in method's signature, print ERROR message in server's log.
+                // 对于未在方法签名中声明的非检查型异常，记录ERROR级别的日志
                 logger.error(
                         CONFIG_FILTER_VALIDATION_EXCEPTION,
                         "",
@@ -91,27 +102,30 @@ public class ExceptionFilter implements Filter, Filter.Listener {
                                 + exception.getClass().getName() + ": " + exception.getMessage(),
                         exception);
 
-                // directly throw if exception class and interface class are in the same jar file.
+                // 如果异常类与服务接口类在同一个JAR包中，说明是服务内部定义的异常，直接返回
                 String serviceFile = ReflectUtils.getCodeBase(invoker.getInterface());
                 String exceptionFile = ReflectUtils.getCodeBase(exception.getClass());
                 if (serviceFile == null || exceptionFile == null || serviceFile.equals(exceptionFile)) {
                     return;
                 }
-                // directly throw if it's JDK exception
+
+                // 如果是JDK自带的异常（java/javax/jakarta开头），直接返回
                 String className = exception.getClass().getName();
                 if (className.startsWith("java.")
                         || className.startsWith("javax.")
                         || className.startsWith("jakarta.")) {
                     return;
                 }
-                // directly throw if it's dubbo exception
+
+                // 如果是Dubbo框架自身的异常，直接返回
                 if (exception instanceof RpcException) {
                     return;
                 }
 
-                // otherwise, wrap with RuntimeException and throw back to the client
+                // 对于其他所有未预期的异常，包装为RuntimeException并转换为字符串形式，防止客户端反序列化失败
                 appResponse.setException(new RuntimeException(StringUtils.toString(exception)));
             } catch (Throwable e) {
+                // 捕获过滤器自身处理过程中的异常，避免影响主业务流程
                 logger.warn(
                         CONFIG_FILTER_VALIDATION_EXCEPTION,
                         "",
@@ -126,8 +140,18 @@ public class ExceptionFilter implements Filter, Filter.Listener {
         }
     }
 
+
+    /**
+     * 处理RPC调用过程中的异常事件
+     * 当调用链中出现未被捕获的异常时，记录包含调用方、服务接口、方法及异常详情的错误日志
+     *
+     * @param e 捕获到的异常对象
+     * @param invoker 调用器对象，用于获取服务接口名称等元数据
+     * @param invocation 调用上下文对象，包含被调用的方法名等信息
+     */
     @Override
     public void onError(Throwable e, Invoker<?> invoker, Invocation invocation) {
+        // 记录未检查且未声明的异常信息，便于服务端排查问题
         logger.error(
                 CONFIG_FILTER_VALIDATION_EXCEPTION,
                 "",

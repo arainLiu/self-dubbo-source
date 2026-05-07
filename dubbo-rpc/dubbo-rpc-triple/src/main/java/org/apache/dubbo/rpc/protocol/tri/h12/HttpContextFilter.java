@@ -32,19 +32,34 @@ import org.apache.dubbo.rpc.protocol.tri.TripleConstants;
 @Activate(group = CommonConstants.PROVIDER, order = -29000)
 public class HttpContextFilter implements Filter {
 
+    /**
+     * 处理HTTP上下文信息，将请求和响应对象注入到RpcContext中
+     * 仅当调用链路中存在处理器类型标识时才执行上下文设置逻辑
+     *
+     * @param invoker 调用器对象，用于执行后续的RPC调用链
+     * @param invocation 调用上下文对象，包含HTTP请求、响应及处理器类型等信息
+     * @return RPC调用结果
+     * @throws RpcException 当RPC调用过程中发生异常时抛出
+     */
     @Override
     public Result invoke(Invoker<?> invoker, Invocation invocation) throws RpcException {
+        // 检查是否存在处理器类型标识，不存在则跳过上下文处理直接调用
         if (invocation.get(TripleConstants.HANDLER_TYPE_KEY) == null) {
             return invoker.invoke(invocation);
         }
 
+        // 从Invocation中提取HTTP请求和响应对象
         HttpRequest request = (HttpRequest) invocation.get(TripleConstants.HTTP_REQUEST_KEY);
         HttpResponse response = (HttpResponse) invocation.get(TripleConstants.HTTP_RESPONSE_KEY);
+
+        // 获取当前服务的RPC上下文，并设置远程和本地地址信息
         RpcServiceContext context = RpcContext.getServiceContext();
         context.setRemoteAddress(request.remoteHost(), request.remotePort());
         if (context.getLocalAddress() == null) {
             context.setLocalAddress(request.localHost(), request.localPort());
         }
+
+        // 将HTTP请求和响应对象注入到上下文中，供后续业务逻辑使用
         context.setRequest(request);
         context.setResponse(response);
         return invoker.invoke(invocation);

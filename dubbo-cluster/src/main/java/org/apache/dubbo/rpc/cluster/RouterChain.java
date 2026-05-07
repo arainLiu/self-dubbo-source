@@ -48,6 +48,19 @@ public class RouterChain<T> {
     private volatile SingleRouterChain<T> backupChain;
     private volatile SingleRouterChain<T> currentChain;
 
+    /**
+     * 构建路由链对象，包含多个独立的路由链实例以支持并发场景下的无锁读取。
+     * <p>
+     * 该方法通过调用buildSingleChain()创建两个完全独立的SingleRouterChain实例，
+     * 并将它们封装到RouterChain中。这种双链设计是Dubbo的优化策略：
+     * 在路由链更新时，可以交替使用两条链，避免在重建路由规则时影响正在进行的RPC调用，
+     * 实现读写分离和无锁化操作，提升高并发场景下的性能。
+     * </p>
+     *
+     * @param interfaceClass 服务接口类型，用于加载与该接口关联的路由规则
+     * @param url 包含路由配置的URL对象，通常为消费者URL或订阅URL
+     * @return 包含两条单路由链的RouterChain对象
+     */
     @SuppressWarnings({"rawtypes", "unchecked"})
     public static <T> RouterChain<T> buildChain(Class<T> interfaceClass, URL url) {
         SingleRouterChain<T> chain1 = buildSingleChain(interfaceClass, url);
@@ -55,9 +68,36 @@ public class RouterChain<T> {
         return new RouterChain<>(new SingleRouterChain[] {chain1, chain2});
     }
 
+
+    /**
+     * 构建单个路由链实例，加载并组装所有激活的路由器和状态路由器。
+     * <p>
+     * 该方法负责从模块模型中扩展加载器获取所有激活的路由工厂和状态路由工厂，
+     * 创建具体的路由器实例并按优先级排序，最终构建成一个完整的路由链。
+     * </p>
+     * <p>
+     * 处理流程：
+     * <ol>
+     *   <li>从URL中提取ModuleModel，用于获取扩展加载器</li>
+     *   <li>加载所有激活的RouterFactory扩展（通过ROUTER_KEY参数筛选），调用getRouter()创建路由器实例</li>
+     *   <li>对普通路由器进行排序（通过Router.compareTo()），确保路由规则按正确顺序执行</li>
+     *   <li>加载所有激活的StateRouterFactory扩展，创建状态路由器实例（无需排序）</li>
+     *   <li>从配置中读取SHOULD_FAIL_FAST参数，决定是否在路由失败时快速抛出异常</li>
+     *   <li>获取RouterSnapshotSwitcher单例Bean，用于管理路由快照的启用/禁用状态</li>
+     *   <li>创建并返回SingleRouterChain实例，包含普通路由器列表、状态路由器列表、快速失败标志和快照开关</li>
+     * </ol>
+     * </p>
+     *
+     * @param interfaceClass 服务接口类型，用于状态路由器创建时绑定接口信息
+     * @param url 包含路由配置的URL对象，通常为消费者URL或订阅URL
+     * @return 构建完成的SingleRouterChain实例，包含所有激活的路由规则
+     */
     public static <T> SingleRouterChain<T> buildSingleChain(Class<T> interfaceClass, URL url) {
         ModuleModel moduleModel = url.getOrDefaultModuleModel();
 
+        /*
+         * 加载所有激活的普通路由器工厂，创建路由器实例并按优先级排序
+         */
         List<RouterFactory> extensionFactories =
                 moduleModel.getExtensionLoader(RouterFactory.class).getActivateExtension(url, ROUTER_KEY);
 
@@ -66,14 +106,23 @@ public class RouterChain<T> {
                 .sorted(Router::compareTo)
                 .collect(Collectors.toList());
 
+        /*
+         * 加载所有激活的状态路由器工厂，创建状态路由器实例
+         */
         List<StateRouter<T>> stateRouters =
                 moduleModel.getExtensionLoader(StateRouterFactory.class).getActivateExtension(url, ROUTER_KEY).stream()
                         .map(factory -> factory.getRouter(interfaceClass, url))
                         .collect(Collectors.toList());
 
+        /*
+         * 读取快速失败配置，默认值为true
+         */
         boolean shouldFailFast = Boolean.parseBoolean(
                 ConfigurationUtils.getProperty(moduleModel, Constants.SHOULD_FAIL_FAST_KEY, "true"));
 
+        /*
+         * 获取路由快照开关Bean，用于管理快照功能
+         */
         RouterSnapshotSwitcher routerSnapshotSwitcher =
                 ScopeModelUtil.getFrameworkModel(moduleModel).getBeanFactory().getBean(RouterSnapshotSwitcher.class);
 

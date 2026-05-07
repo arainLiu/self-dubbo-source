@@ -70,7 +70,28 @@ public class ZookeeperRegistry extends CacheableFailbackRegistry {
             new ConcurrentHashMap<>();
 
     private ZookeeperClient zkClient;
-
+    /**
+     * 构造ZooKeeper注册中心实例，初始化连接并注册会话状态监听器。
+     * <p>
+     * 该构造方法负责建立与ZooKeeper集群的连接，并根据不同的会话状态执行相应的恢复策略：
+     * <ul>
+     *   <li><b>RECONNECTED（重连成功）</b>：当网络抖动导致连接断开后重新连接时，调用fetchLatestAddresses()获取最新的服务提供者地址列表，
+     *       因为在连接断开期间可能有服务上下线变化。由于临时节点在连接丢失时不会被删除，所以不需要重新注册当前实例的地址</li>
+     *   <li><b>NEW_SESSION_CREATED（新会话创建）</b>：当会话过期后创建新会话时，调用recover()重新注册所有服务URL并重新订阅所有监听器，
+     *       因为旧会话中的临时节点已被ZooKeeper清理</li>
+     *   <li><b>SESSION_LOST（会话丢失）</b>：记录警告日志，提示当前实例的地址将从注册中心删除，等待新会话创建后重新注册</li>
+     *   <li><b>SUSPENDED（连接挂起）和CONNECTED（已连接）</b>：暂不处理，仅作为状态占位</li>
+     * </ul>
+     * </p>
+     * <p>
+     * 异常处理：对于NEW_SESSION_CREATED场景的恢复操作，如果发生异常会记录错误日志但不中断流程，
+     * 确保注册中心能够在后续重试中恢复正常。
+     * </p>
+     *
+     * @param url 注册中心的URL地址，包含ZooKeeper服务器地址、端口、根路径等配置，不能为null或anyhost
+     * @param zookeeperClientManager ZooKeeper客户端管理器，用于创建和管理与ZooKeeper集群的连接
+     * @throws IllegalStateException 当URL配置了anyhost（0.0.0.0）时抛出，因为注册中心地址必须是明确的主机地址
+     */
     public ZookeeperRegistry(URL url, ZookeeperClientManager zookeeperClientManager) {
         super(url);
 
@@ -78,14 +99,23 @@ public class ZookeeperRegistry extends CacheableFailbackRegistry {
             throw new IllegalStateException("registry address == null");
         }
 
+        /*
+         * 解析并规范化根路径，确保以"/"开头
+         */
         String group = url.getGroup(DEFAULT_ROOT);
         if (!group.startsWith(PATH_SEPARATOR)) {
             group = PATH_SEPARATOR + group;
         }
 
         this.root = group;
+        /*
+         * 通过客户端管理器建立与ZooKeeper集群的连接
+         */
         this.zkClient = zookeeperClientManager.connect(url);
 
+        /*
+         * 注册ZooKeeper会话状态监听器，根据不同的连接状态执行相应的恢复逻辑
+         */
         this.zkClient.addStateListener((state) -> {
             if (state == StateListener.RECONNECTED) {
                 logger.warn(
@@ -122,6 +152,7 @@ public class ZookeeperRegistry extends CacheableFailbackRegistry {
             }
         });
     }
+
 
     @Override
     public boolean isAvailable() {

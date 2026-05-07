@@ -712,14 +712,37 @@ public abstract class AbstractConfig implements Serializable {
         }
     }
 
-    /**
-     * Dubbo config property override
+        /**
+     * 刷新配置对象的字段值，从外部配置源（如配置文件、系统属性等）加载并覆盖当前配置。
+     * <p>
+     * 该方法采用懒加载策略，只有在needRefresh标志为true时才执行实际的刷新操作。
+     * 刷新过程分为三个阶段：
+     * <ol>
+     *   <li><b>预处理</b>：调用preProcessRefresh()进行检查和初始化准备工作</li>
+     *   <li><b>配置加载</b>：调用refreshWithPrefixes()根据getPrefixes()返回的配置前缀和getConfigMode()返回的配置模式，
+     *       从外部配置源读取并覆盖字段值</li>
+     *   <li><b>后处理</b>：调用postProcessRefresh()执行刷新后的清理和验证工作</li>
+     * </ol>
+     * </p>
+     * <p>
+     * 异常处理：任何刷新过程中的异常都会被捕获并记录错误日志，然后抛出IllegalStateException，
+     * 确保配置错误能够被及时发现和处理。
+     * </p>
+     * <p>
+     * 线程安全：通过refreshed原子标志保证配置只会被刷新一次，避免重复刷新导致的性能开销和状态不一致。
+     * </p>
      */
     public void refresh() {
         if (needRefresh) {
             try {
                 // check and init before do refresh
+                /*
+                 * 执行刷新前的检查和初始化准备工作
+                 */
                 preProcessRefresh();
+                /*
+                 * 根据配置前缀和模式从外部配置源加载并覆盖字段值
+                 */
                 refreshWithPrefixes(getPrefixes(), getConfigMode());
             } catch (Exception e) {
                 logger.error(

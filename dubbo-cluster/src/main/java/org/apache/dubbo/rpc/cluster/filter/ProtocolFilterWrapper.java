@@ -83,6 +83,24 @@ public class ProtocolFilterWrapper implements Protocol {
                 .getDefaultExtension();
     }
 
+    /**
+     * 创建服务引用的Invoker，并为非注册中心场景构建过滤器链。
+     * <p>
+     * 该方法在消费者引用服务时被调用，负责根据URL类型决定是否应用过滤器链：
+     * <ul>
+     *   <li>如果是注册中心URL（registry://协议），直接委托给底层protocol创建Invoker，不应用过滤器</li>
+     *   <li>如果是普通服务URL，先调用底层protocol创建基础Invoker，再通过FilterChainBuilder构建包含所有激活过滤器的责任链</li>
+     * </ul>
+     * </p>
+     * <p>
+     * 这种设计确保了过滤器只在真正的服务调用层面生效，而在注册中心交互层面（如订阅、发现等）不执行额外的过滤逻辑。
+     * </p>
+     *
+     * @param type 服务接口类型，表示要引用的远程服务契约
+     * @param url 服务URL，包含注册地址、协议、参数等配置信息
+     * @return 创建的Invoker对象，可能包含过滤器链增强的逻辑
+     * @throws RpcException 当创建Invoker失败时抛出
+     */
     @Override
     public <T> Invoker<T> refer(Class<T> type, URL url) throws RpcException {
         if (UrlUtils.isRegistry(url)) {

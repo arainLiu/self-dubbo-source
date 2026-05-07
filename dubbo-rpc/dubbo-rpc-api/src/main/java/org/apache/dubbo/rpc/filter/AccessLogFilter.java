@@ -96,23 +96,25 @@ public class AccessLogFilter implements Filter {
      */
     public AccessLogFilter() {}
 
-    /**
-     * This method logs the access log for service method invocation call.
+        /**
+     * 记录服务方法调用的访问日志
+     * 在调用前后捕获请求上下文，并通过异步任务将日志写入指定路径或控制台
      *
-     * @param invoker service
-     * @param inv     Invocation service method.
-     * @return Result from service method.
-     * @throws RpcException
+     * @param invoker 服务调用器，用于获取URL配置和服务元数据
+     * @param inv     调用上下文对象，包含方法名、参数及调用时间等信息
+     * @return 服务方法调用的结果
+     * @throws RpcException 当RPC调用过程中发生异常时抛出
      */
     @Override
     public Result invoke(Invoker<?> invoker, Invocation inv) throws RpcException {
+        // 从URL配置中获取访问日志的输出路径或标识符
         String accessLogKey = invoker.getUrl().getParameter(Constants.ACCESS_LOG_KEY);
         boolean isFixedPath = invoker.getUrl().getParameter(ACCESS_LOG_FIXED_PATH_KEY, true);
+
+        // 如果配置中禁用了访问日志，则取消定时任务并直接执行调用
         if (StringUtils.isEmpty(accessLogKey) || "false".equalsIgnoreCase(accessLogKey)) {
-            // Notice that disable accesslog of one service may cause the whole application to stop collecting
-            // accesslog.
-            // It's recommended to use application level configuration to enable or disable accesslog if dynamically
-            // configuration is needed .
+            // 注意：禁用某个服务的访问日志可能会导致整个应用停止收集访问日志
+            // 如果需要动态控制，建议使用应用级别的配置来启用或禁用
             if (future != null && !future.isCancelled()) {
                 future.cancel(true);
                 logger.info("Access log task cancelled ...");
@@ -120,6 +122,7 @@ public class AccessLogFilter implements Filter {
             return invoker.invoke(inv);
         }
 
+        // 使用CAS操作确保只启动一次后台日志刷新任务
         if (scheduled.compareAndSet(false, true)) {
             future = inv.getModuleModel()
                     .getApplicationModel()
@@ -134,6 +137,8 @@ public class AccessLogFilter implements Filter {
                             TimeUnit.MILLISECONDS);
             logger.info("Access log task started ...");
         }
+
+        // 构建访问日志数据对象，若构建失败则记录警告但不影响主流程
         Optional<AccessLogData> optionalAccessLogData = Optional.empty();
         try {
             optionalAccessLogData = Optional.of(buildAccessLogData(invoker, inv));
@@ -145,11 +150,14 @@ public class AccessLogFilter implements Filter {
                     "Exception in AccessLogFilter of service(" + invoker + " -> " + inv + ")",
                     t);
         }
+
+        // 执行实际的服务调用，并在finally块中处理日志记录逻辑
         try {
             return invoker.invoke(inv);
         } finally {
             String finalAccessLogKey = accessLogKey;
             optionalAccessLogData.ifPresent(logData -> {
+                // 设置调用结束时间，并将日志数据加入待输出队列
                 logData.setOutTime(new Date());
                 log(finalAccessLogKey, logData, isFixedPath);
             });

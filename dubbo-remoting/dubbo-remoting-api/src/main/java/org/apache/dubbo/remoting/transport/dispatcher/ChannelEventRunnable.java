@@ -55,10 +55,17 @@ public class ChannelEventRunnable implements Runnable {
         this.exception = exception;
     }
 
+       /**
+     * 执行通道事件处理逻辑
+     * 根据当前通道状态（CONNECTED、DISCONNECTED、RECEIVED、SENT、CAUGHT）调用对应的处理器方法
+     * 在任务执行前后管理InternalThreadLocalMap的生命周期，确保线程局部变量正确清理和恢复
+     */
     @Override
     public void run() {
+        // 获取并移除当前线程的ThreadLocalMap，用于后续恢复
         InternalThreadLocalMap internalThreadLocalMap = InternalThreadLocalMap.getAndRemove();
         try {
+            // 处理消息接收事件，这是最频繁的事件类型
             if (state == ChannelState.RECEIVED) {
                 try {
                     handler.received(channel, message);
@@ -72,8 +79,10 @@ public class ChannelEventRunnable implements Runnable {
                             e);
                 }
             } else {
+                // 处理其他类型的通道状态变化事件
                 switch (state) {
                     case CONNECTED:
+                        // 处理通道连接建立事件
                         try {
                             handler.connected(channel);
                         } catch (Exception e) {
@@ -86,6 +95,7 @@ public class ChannelEventRunnable implements Runnable {
                         }
                         break;
                     case DISCONNECTED:
+                        // 处理通道连接断开事件
                         try {
                             handler.disconnected(channel);
                         } catch (Exception e) {
@@ -98,6 +108,7 @@ public class ChannelEventRunnable implements Runnable {
                         }
                         break;
                     case SENT:
+                        // 处理消息发送完成事件
                         try {
                             handler.sent(channel, message);
                         } catch (Exception e) {
@@ -111,6 +122,7 @@ public class ChannelEventRunnable implements Runnable {
                         }
                         break;
                     case CAUGHT:
+                        // 处理通道中捕获的异常事件
                         try {
                             handler.caught(channel, exception);
                         } catch (Exception e) {
@@ -124,6 +136,7 @@ public class ChannelEventRunnable implements Runnable {
                         }
                         break;
                     default:
+                        // 记录未识别的通道状态，属于异常情况
                         logger.warn(
                                 INTERNAL_ERROR,
                                 "unknown error in remoting module",
@@ -132,6 +145,7 @@ public class ChannelEventRunnable implements Runnable {
                 }
             }
         } finally {
+            // 恢复线程的ThreadLocalMap，确保线程复用时的上下文正确性
             InternalThreadLocalMap.set(internalThreadLocalMap);
         }
     }

@@ -457,10 +457,25 @@ public class DefaultModuleDeployer extends AbstractDeployer<ModuleModel> impleme
         applicationDeployer.notifyModuleChanged(moduleModel, DeployState.STARTING);
     }
 
+        /**
+     * 处理模块启动完成后的回调逻辑，更新状态并通知应用层。
+     * <p>
+     * 该方法在模块成功启动后被调用，执行以下操作：
+     * <ol>
+     *   <li>检查模块当前是否处于启动中（STARTING）状态，确保状态转换的合法性</li>
+     *   <li>将模块状态更新为已启动（STARTED）</li>
+     *   <li>记录模块启动成功的日志信息</li>
+     *   <li>通知应用部署器模块状态已变更，触发应用级别的协调和同步逻辑</li>
+     * </ol>
+     * </p>
+     */
     private void onModuleStarted() {
         if (isStarting()) {
             setStarted();
             logger.info(getIdentifier() + " has started.");
+            /*
+             * 通知应用部署器模块状态已变更为STARTED，触发后续的应用级注册逻辑
+             */
             applicationDeployer.notifyModuleChanged(moduleModel, DeployState.STARTED);
         }
     }

@@ -52,17 +52,27 @@ public class DecodeHandler extends AbstractChannelHandlerDelegate {
         handler.received(channel, message);
     }
 
+        /**
+     * 解码可解码的消息对象
+     * 如果消息实现了Decodeable接口，则触发其解码逻辑；否则直接返回
+     * 该方法会捕获解码过程中的所有异常，避免影响后续处理流程
+     *
+     * @param message 待解码的消息对象，可能为Request、Response或其他类型
+     */
     private void decode(Object message) {
+        // 检查消息是否支持解码，不支持则直接返回
         if (!(message instanceof Decodeable)) {
             return;
         }
 
         try {
+            // 执行解码操作，将字节数据转换为业务对象
             ((Decodeable) message).decode();
             if (log.isDebugEnabled()) {
                 log.debug("Decode decodeable message " + message.getClass().getName());
             }
         } catch (Throwable e) {
+            // 捕获解码异常并记录警告日志，不向上抛出以避免中断处理流程
             if (log.isWarnEnabled()) {
                 log.warn(TRANSPORT_FAILED_DECODE, "", "", "Call Decodeable.decode failed: " + e.getMessage(), e);
             }

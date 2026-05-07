@@ -79,10 +79,26 @@ public class DubboInvoker<T> extends AbstractInvoker<T> {
         this(serviceType, url, clientsProvider, null);
     }
 
+    /**
+     * 构造Dubbo协议的RPC调用器，初始化网络连接提供者和关闭超时配置。
+     * <p>
+     * 该构造方法负责创建用于发起Dubbo RPC调用的核心组件。它首先调用父类构造函数，指定服务类型、URL以及需要从普通参数中过滤掉的敏感或内部键（如INTERFACE_KEY、GROUP_KEY、TOKEN_KEY），确保这些元数据不会作为业务参数传递给服务端。
+     * 随后，保存客户端连接提供者以支持后续的请求发送，并将当前实例注册到全局Invoker集合中以便统一管理生命周期。
+     * 最后，从应用模型中读取服务器关闭超时时间，用于在销毁阶段优雅地等待未完成的任务。
+     * </p>
+     *
+     * @param serviceType 服务接口类型，定义了远程调用的契约
+     * @param url 服务URL，包含目标地址、端口、协议版本及各项配置参数
+     * @param clientsProvider 客户端连接提供者，负责管理底层的ExchangeClient实例（支持共享或独占模式）
+     * @param invokers 全局Invoker集合引用，用于在协议销毁时统一清理资源
+     */
     public DubboInvoker(Class<T> serviceType, URL url, ClientsProvider clientsProvider, Set<Invoker<?>> invokers) {
         super(serviceType, url, new String[] {INTERFACE_KEY, GROUP_KEY, TOKEN_KEY});
         this.clientsProvider = clientsProvider;
         this.invokers = invokers;
+        /*
+         * 从配置中获取服务器关闭超时时间，用于优雅停机逻辑
+         */
         this.serverShutdownTimeout = ConfigurationUtils.getServerShutdownTimeout(getUrl().getScopeModel());
     }
 

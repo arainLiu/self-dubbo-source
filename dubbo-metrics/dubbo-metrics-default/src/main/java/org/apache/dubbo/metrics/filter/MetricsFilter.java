@@ -66,9 +66,32 @@ public class MetricsFilter implements ScopeModelAware {
         return invoke(invoker, invocation, PROVIDER.equals(MetricsSupport.getSide(invocation)));
     }
 
+    /**
+     * 在RPC调用执行前采集监控指标，记录请求开始事件并初始化上下文信息。
+     * <p>
+     * 该方法是Dubbo监控体系的核心入口点之一，负责在调用链路的最前端捕获请求信息。
+     * 如果启用了RPC监控功能（rpcMetricsEnable=true），它会构建一个RequestEvent对象，
+     * 其中包含应用模型、应用名称、调用类型（提供者或消费者）以及服务层级等元数据。
+     * 随后通过MetricsEventBus.before()触发“调用前”的指标统计（如QPS、并发数等），
+     * 并将该事件对象存入Invocation上下文中，以便在调用结束后关联后续的耗时和结果统计。
+     * </p>
+     * <p>
+     * 异常处理：监控逻辑的执行被包裹在try-catch中，确保即使指标采集发生异常，
+     * 也不会影响核心业务调用的正常进行，仅记录警告日志。
+     * </p>
+     *
+     * @param invoker 当前调用的执行器，代表远程服务的代理
+     * @param invocation 封装了方法名、参数及附件的调用对象
+     * @param isProvider 标识当前是服务端（true）还是客户端（false）视角
+     * @return 远程调用的执行结果
+     * @throws RpcException 当底层调用发生异常时抛出
+     */
     public Result invoke(Invoker<?> invoker, Invocation invocation, boolean isProvider) throws RpcException {
         if (rpcMetricsEnable) {
             try {
+                /*
+                 * 构建请求事件并触发调用前的指标统计逻辑
+                 */
                 RequestEvent requestEvent = RequestEvent.toRequestEvent(
                         applicationModel,
                         appName,
@@ -78,6 +101,9 @@ public class MetricsFilter implements ScopeModelAware {
                         isProvider ? PROVIDER : CONSUMER,
                         serviceLevel);
                 MetricsEventBus.before(requestEvent);
+                /*
+                 * 将事件对象存入上下文，供调用结束后的后置处理使用
+                 */
                 invocation.put(METRIC_FILTER_EVENT, requestEvent);
             } catch (Throwable t) {
                 LOGGER.warn(INTERNAL_ERROR, "", "", "Error occurred when invoke.", t);

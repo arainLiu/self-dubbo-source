@@ -67,12 +67,27 @@ public class MetricsClusterFilter implements ClusterFilter, BaseFilter.Listener,
         handleMethodException(t, invocation);
     }
 
+    /**
+     * 处理调用过程中的异常并上报特定的监控事件，重点关注权限拒绝类错误。
+     * <p>
+     * 该方法在捕获到远程调用异常时被调用。它首先检查指标采集器是否处于启用状态。
+     * 如果异常类型为 {@link RpcException} 且属于禁止访问（Forbidden）错误，
+     * 则构建一个包含应用信息、调用上下文及错误码的请求错误事件（RequestErrorEvent），
+     * 并通过 MetricsEventBus 发布该事件，以便监控系统记录服务调用的失败原因和分布情况。
+     * </p>
+     *
+     * @param t 调用过程中捕获的原始异常对象
+     * @param invocation 当前的 RPC 调用对象，用于提取服务名、方法名等元数据
+     */
     private void handleMethodException(Throwable t, Invocation invocation) {
         if (collector == null || !collector.isCollectEnabled()) {
             return;
         }
         if (t instanceof RpcException) {
             RpcException e = (RpcException) t;
+            /*
+             * 针对权限拒绝类错误（Forbidden）发布请求异常监控事件
+             */
             if (e.isForbidden()) {
                 MetricsEventBus.publish(RequestEvent.toRequestErrorEvent(
                         applicationModel,

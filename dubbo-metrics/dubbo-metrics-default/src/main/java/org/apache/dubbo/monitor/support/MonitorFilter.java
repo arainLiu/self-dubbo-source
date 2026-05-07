@@ -84,28 +84,34 @@ public class MonitorFilter implements Filter, Filter.Listener {
     }
 
     /**
-     * The invocation interceptor,it will collect the invoke data about this invocation and send it to monitor center
+     * 调用拦截器，负责收集当前调用的监控数据并准备发送至监控中心
+     * 在调用执行前记录开始时间、远程主机地址，并增加并发计数
      *
-     * @param invoker    service
-     * @param invocation invocation.
-     * @return {@link Result} the invoke result
-     * @throws RpcException
+     * @param invoker    服务调用器，用于获取URL配置和服务模型
+     * @param invocation 调用上下文对象，用于存储监控相关的临时数据
+     * @return {@link Result} 调用执行结果
+     * @throws RpcException 当RPC调用过程中发生异常时抛出
      */
     @Override
     public Result invoke(Invoker<?> invoker, Invocation invocation) throws RpcException {
+        // 如果URL中配置了监控器，则执行监控数据采集逻辑
         if (invoker.getUrl().hasAttribute(MONITOR_KEY)) {
+            // 记录调用开始时间戳
             invocation.put(MONITOR_FILTER_START_TIME, System.currentTimeMillis());
+            // 记录发起调用的远程主机地址
             invocation.put(
                     MONITOR_REMOTE_HOST_STORE, RpcContext.getServiceContext().getRemoteHost());
-            // count up
+            // 增加当前服务的并发调用计数
             getConcurrent(invoker, invocation).incrementAndGet();
         }
+
+        // 如果是服务提供者模型，更新最后一次调用时间
         ServiceModel serviceModel = invoker.getUrl().getServiceModel();
         if (serviceModel instanceof ProviderModel) {
             ((ProviderModel) serviceModel).updateLastInvokeTime();
         }
 
-        // proceed invocation chain
+        // 继续执行后续的调用链
         return invoker.invoke(invocation);
     }
 

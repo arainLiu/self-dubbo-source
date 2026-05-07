@@ -116,22 +116,38 @@ public class WrappedChannelHandler implements ChannelHandlerDelegate {
      * @param msg
      * @return
      */
+    /**
+     * 获取处理消息的首选线程池执行器
+     * 该方法主要针对消费端的线程模型进行优化，根据消息类型选择合适的执行策略：
+     * 1. 对于响应消息，优先使用发起调用的线程（ThreadlessExecutor）直接执行回调
+     * 2. 其他情况使用共享的线程池执行器处理
+     *
+     * @param msg 待处理的消息对象，通常为Request或Response类型
+     * @return 用于执行消息处理逻辑的线程池执行器
+     */
     public ExecutorService getPreferredExecutorService(Object msg) {
+        // 针对响应消息进行特殊处理，以支持调用线程直接执行回调
         if (msg instanceof Response) {
             Response response = (Response) msg;
+
+            // 根据响应ID获取关联的DefaultFuture对象
             DefaultFuture responseFuture = DefaultFuture.getFuture(response.getId());
-            // a typical scenario is the response returned after timeout, the timeout response may have completed the
-            // future
+
+            // 如果Future不存在（如超时后返回的响应），则使用共享线程池处理
             if (responseFuture == null) {
                 return getSharedExecutorService();
             } else {
+                // 尝试获取Future绑定的专用执行器
                 ExecutorService executor = responseFuture.getExecutor();
+
+                // 如果专用执行器不可用或已关闭，则降级使用共享执行器
                 if (executor == null || executor.isShutdown()) {
                     executor = getSharedExecutorService(msg);
                 }
                 return executor;
             }
         } else {
+            // 非响应消息（如请求消息）直接使用共享线程池处理
             return getSharedExecutorService(msg);
         }
     }

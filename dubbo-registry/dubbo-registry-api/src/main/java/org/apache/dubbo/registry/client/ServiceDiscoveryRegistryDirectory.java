@@ -140,18 +140,49 @@ public class ServiceDiscoveryRegistryDirectory<T> extends DynamicDirectory<T> {
                 !CommonConstants.CONSUMER.equals(protocol) ? protocol : null);
     }
 
+    /**
+     * 订阅服务目录，根据配置决定是否启用动态配置监听功能。
+     * <p>
+     * 该方法在基于服务发现的注册中心场景下使用，负责初始化订阅逻辑并可选地注册配置变更监听器。
+     * 主要执行以下操作：
+     * <ol>
+     *   <li>检查是否启用了配置监听功能（ENABLE_CONFIGURATION_LISTEN），默认值为true：
+     *     <ul>
+     *       <li>如果启用，设置enableConfigurationListen标志为true，注册应用级消费者配置监听器和引用级配置监听器，
+     *           使得当配置中心发布配置变更时能够自动刷新服务目录</li>
+     *       <li>如果禁用，设置enableConfigurationListen标志为false，不注册任何配置监听器，减少资源占用</li>
+     *     </ul>
+     *   </li>
+     *   <li>调用父类DynamicDirectory.subscribe()方法执行实际的注册中心订阅操作，建立与注册中心的连接</li>
+     * </ol>
+     * </p>
+     *
+     * @param url 订阅URL，包含服务接口、版本、分组、协议等消费者配置信息
+     */
     @Override
     public void subscribe(URL url) {
+        /*
+         * 检查是否启用了动态配置监听功能，默认为true
+         */
         if (moduleModel
                 .modelEnvironment()
                 .getConfiguration()
                 .convert(Boolean.class, Constants.ENABLE_CONFIGURATION_LISTEN, true)) {
             enableConfigurationListen = true;
+            /*
+             * 注册应用级消费者配置监听器，接收全局配置变更通知
+             */
             getConsumerConfigurationListener(moduleModel).addNotifyListener(this);
+            /*
+             * 创建引用级配置监听器，监听当前服务引用的专属配置变更
+             */
             referenceConfigurationListener = new ReferenceConfigurationListener(this.moduleModel, this, url);
         } else {
             enableConfigurationListen = false;
         }
+        /*
+         * 调用父类方法执行实际的注册中心订阅操作
+         */
         super.subscribe(url);
     }
 

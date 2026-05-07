@@ -126,10 +126,40 @@ public class RegistryDirectory<T> extends DynamicDirectory<T> {
         consumerConfigurationListener = getConsumerConfigurationListener(moduleModel);
     }
 
+    /**
+     * 订阅服务目录，监听注册中心的服务提供者变化并接收配置更新通知。
+     * <p>
+     * 该方法在消费者启动时调用，负责初始化订阅逻辑并建立与注册中心的连接。
+     * 主要执行以下操作：
+     * <ol>
+     *   <li><b>协议SPI校验</b>：从queryMap中提取配置的协议列表，逐个检查Protocol扩展加载器中是否存在对应的实现类。
+     *       如果找不到匹配的协议实现，立即抛出IllegalStateException，避免因缺少SPI模块导致运行时错误</li>
+     *   <li><b>配置监听器注册</b>：检查是否启用了配置监听功能（ENABLE_CONFIGURATION_LISTEN），如果启用则：
+     *     <ul>
+     *       <li>向consumerConfigurationListener注册当前目录对象为监听者，接收应用级配置变更通知</li>
+     *       <li>创建ReferenceConfigurationListener实例，监听引用级别的配置变更</li>
+     *     </ul>
+     *   </li>
+     *   <li><b>执行订阅并上报监控事件</b>：
+     *     <ul>
+     *       <li>提取注册中心集群名称（优先使用registry.cluster参数，否则使用protocol参数）</li>
+     *       <li>通过MetricsEventBus发布订阅事件，记录订阅行为的监控指标</li>
+     *       <li>调用父类DynamicDirectory.subscribe()方法执行实际的注册中心订阅操作</li>
+     *     </ul>
+     *   </li>
+     * </ol>
+     * </p>
+     *
+     * @param url 订阅URL，包含服务接口、版本、分组、协议等消费者配置信息
+     * @throws IllegalStateException 当配置的协议在SPI扩展中找不到对应实现时抛出
+     */
     @Override
     public void subscribe(URL url) {
 
         // Fail-fast detection protocol spi
+        /*
+         * 校验配置的协议是否有对应的SPI实现，快速失败避免运行时错误
+         */
         String queryProtocols = this.queryMap.get(PROTOCOL_KEY);
         if (StringUtils.isNotBlank(queryProtocols)) {
             String[] acceptProtocols = queryProtocols.split(",");
@@ -145,6 +175,9 @@ public class RegistryDirectory<T> extends DynamicDirectory<T> {
         }
 
         ApplicationModel applicationModel = url.getApplicationModel();
+        /*
+         * 如果启用了配置监听功能，则注册应用级和引用级的配置变更监听器
+         */
         if (moduleModel
                 .modelEnvironment()
                 .getConfiguration()
@@ -156,6 +189,9 @@ public class RegistryDirectory<T> extends DynamicDirectory<T> {
                 .getParameter(
                         RegistryConstants.REGISTRY_CLUSTER_KEY,
                         registry.getUrl().getParameter(PROTOCOL_KEY));
+        /*
+         * 发布订阅监控事件并执行实际的注册中心订阅操作
+         */
         MetricsEventBus.post(RegistryEvent.toSubscribeEvent(applicationModel, registryClusterName), () -> {
             super.subscribe(url);
             return null;

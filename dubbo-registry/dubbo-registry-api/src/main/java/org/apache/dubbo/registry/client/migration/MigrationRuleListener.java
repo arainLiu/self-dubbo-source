@@ -273,17 +273,50 @@ public class MigrationRuleListener implements RegistryProtocolListener, Configur
     @Override
     public void onExport(RegistryProtocol registryProtocol, Exporter<?> exporter) {}
 
+    /**
+     * 处理服务引用时的迁移规则初始化和执行，确保每个MigrationInvoker都有对应的规则处理器。
+     * <p>
+     * 该方法在消费者引用服务时被调用，负责创建或获取迁移规则处理器，并立即执行迁移逻辑。
+     * 主要执行以下操作：
+     * <ol>
+     *   <li>使用ConcurrentHashMapUtils.computeIfAbsent()从handlers映射表中查找当前invoker对应的MigrationRuleHandler</li>
+     *   <li>如果不存在，则创建新的处理器：
+     *     <ul>
+     *       <li>调用invoker.setMigrationRuleListener(this)将当前监听器设置到invoker中，用于后续的状态回调</li>
+     *       <li>创建新的MigrationRuleHandler实例，关联invoker和consumerUrl</li>
+     *     </ul>
+     *   </li>
+     *   <li>调用handler.doMigrate(rule)根据当前的迁移规则执行具体的迁移逻辑，决定使用接口级还是应用级调用</li>
+     * </ol>
+     * </p>
+     * <p>
+     * 这种设计保证了每个MigrationInvoker只会被初始化一次迁移处理器，后续的规则变更会通过监听器机制触发处理器的重新评估，
+     * 实现服务迁移的自动化管理。
+     * </p>
+     *
+     * @param registryProtocol 注册中心协议对象，提供注册、订阅等核心功能
+     * @param invoker 集群Invoker对象，实际类型为MigrationInvoker，支持双模式调用
+     * @param consumerUrl 消费者的URL地址，包含服务引用的配置参数
+     * @param registryURL 注册中心的URL地址，包含注册中心的连接信息
+     */
     @Override
     public void onRefer(
             RegistryProtocol registryProtocol, ClusterInvoker<?> invoker, URL consumerUrl, URL registryURL) {
+        /*
+         * 获取或创建迁移规则处理器，确保每个MigrationInvoker对应唯一的处理器实例
+         */
         MigrationRuleHandler<?> migrationRuleHandler =
                 ConcurrentHashMapUtils.computeIfAbsent(handlers, (MigrationInvoker<?>) invoker, _key -> {
                     ((MigrationInvoker<?>) invoker).setMigrationRuleListener(this);
                     return new MigrationRuleHandler<>((MigrationInvoker<?>) invoker, consumerUrl);
                 });
 
+        /*
+         * 根据当前迁移规则执行迁移逻辑，决定使用接口级还是应用级调用模式
+         */
         migrationRuleHandler.doMigrate(rule);
     }
+
 
     @Override
     public void onDestroy() {

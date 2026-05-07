@@ -197,18 +197,32 @@ public class DefaultFuture extends CompletableFuture<Object> {
         received(channel, response, false);
     }
 
+    /**
+     * 处理接收到的响应消息，完成对应的异步调用并清理相关资源
+     * 根据响应ID查找等待中的DefaultFuture，触发回调逻辑，并取消超时检测任务
+     *
+     * @param channel 网络通道对象，用于获取本地和远程地址信息以记录日志
+     * @param response 接收到的响应对象，包含调用结果或异常信息
+     * @param timeout 标识该响应是否为超时后返回的延迟响应
+     */
     public static void received(Channel channel, Response response, boolean timeout) {
         try {
+            // 从全局映射表中移除并获取与响应ID关联的DefaultFuture对象
             DefaultFuture future = FUTURES.remove(response.getId());
             if (future != null) {
                 Timeout t = future.timeoutCheckTask;
                 if (!timeout) {
-                    // decrease Time
+                    // 如果是正常响应（非超时），则取消超时检测任务以释放资源
                     t.cancel();
                 }
+
+                // 触发Future的完成逻辑，将响应结果设置到Future中并唤醒等待线程
                 future.doReceived(response);
+
+                // 检查并关闭不再需要的执行器
                 shutdownExecutorIfNeeded(future);
             } else {
+                // 如果找不到对应的Future（通常是超时后返回的延迟响应），记录警告日志
                 logger.warn(
                         PROTOCOL_TIMEOUT_SERVER,
                         "",
@@ -223,6 +237,7 @@ public class DefaultFuture extends CompletableFuture<Object> {
                                 + ", please check provider side for detailed result.");
             }
         } finally {
+            // 无论处理成功与否，都从CHANNELS映射中清理该响应ID的记录
             CHANNELS.remove(response.getId());
         }
     }
@@ -251,18 +266,31 @@ public class DefaultFuture extends CompletableFuture<Object> {
         this.cancel(true);
     }
 
+        /**
+     * 根据响应状态完成Future的最终状态设置
+     * 将Response对象中的结果或异常转换为CompletableFuture的完成信号，唤醒等待线程
+     *
+     * @param res 接收到的响应对象，包含状态码、结果数据或错误信息
+     */
     private void doReceived(Response res) {
+        // 校验响应对象的有效性
         if (res == null) {
             throw new IllegalStateException("response cannot be null");
         }
+
+        // 根据响应的状态码执行不同的完成逻辑
         if (res.getStatus() == Response.OK) {
+            // 调用成功，将结果值设置到Future并标记为正常完成
             this.complete(res.getResult());
         } else if (res.getStatus() == Response.CLIENT_TIMEOUT || res.getStatus() == Response.SERVER_TIMEOUT) {
+            // 处理超时异常，区分是服务端超时还是客户端超时
             this.completeExceptionally(
                     new TimeoutException(res.getStatus() == Response.SERVER_TIMEOUT, channel, res.getErrorMessage()));
         } else if (res.getStatus() == Response.SERIALIZATION_ERROR) {
+            // 处理序列化/反序列化错误
             this.completeExceptionally(new SerializationException(res.getErrorMessage()));
         } else {
+            // 处理其他所有类型的远程通信异常
             this.completeExceptionally(new RemotingException(channel, res.getErrorMessage()));
         }
     }

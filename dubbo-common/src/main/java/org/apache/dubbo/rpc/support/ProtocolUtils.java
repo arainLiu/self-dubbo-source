@@ -50,6 +50,27 @@ public class ProtocolUtils {
         return groupServiceKeyCache.getServiceKey(serviceName, serviceVersion, port);
     }
 
+    /**
+     * 判断指定的泛化调用类型标识是否有效，支持多种序列化方式。
+     * <p>
+     * 该方法用于校验服务引用配置中的generic参数是否为Dubbo支持的泛化调用模式。
+     * 泛化调用允许消费者在不依赖服务端接口类的情况下发起RPC调用，常用于网关、测试平台等场景。
+     * </p>
+     * <p>
+     * 支持的泛化调用类型包括：
+     * <ul>
+     *   <li><b>default（普通泛化调用）</b>：使用Dubbo默认的序列化方式，将参数序列化为Map结构</li>
+     *   <li><b>nativejava（JDK序列化）</b>：支持流式泛化调用，使用JDK原生序列化机制</li>
+     *   <li><b>bean（Bean泛化）</b>：基于JavaBean规范的泛化调用方式</li>
+     *   <li><b>protobuf（Protobuf序列化）</b>：使用Google Protocol Buffers进行高效序列化</li>
+     *   <li><b>gson（Gson序列化）</b>：使用Google Gson库进行JSON序列化</li>
+     *   <li><b>raw（原始返回值）</b>：返回未经处理的原始数据格式</li>
+     * </ul>
+     * </p>
+     *
+     * @param generic 泛化调用类型标识字符串，通常从URL参数或配置文件中获取
+     * @return 如果generic非空且属于上述支持的任一类型则返回true，否则返回false
+     */
     public static boolean isGeneric(String generic) {
         return StringUtils.isNotEmpty(generic)
                 && (GENERIC_SERIALIZATION_DEFAULT.equalsIgnoreCase(generic) /* Normal generalization cal */

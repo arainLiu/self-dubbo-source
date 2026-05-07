@@ -83,10 +83,19 @@ public abstract class AbstractProxyInvoker<T> implements Invoker<T> {
     @Override
     public void destroy() {}
 
+    /**
+     * 执行远程代理方法的调用，将Invocation转换为本地方法调用并处理异步结果
+     * 集成性能监控逻辑，并对同步/异步异常进行统一封装
+     *
+     * @param invocation 调用上下文对象，包含方法名、参数类型、参数值及监控上下文
+     * @return RPC调用结果，通常为AsyncRpcResult以支持异步编程模型
+     * @throws RpcException 当远程代理方法调用失败或发生系统级错误时抛出
+     */
     @Override
     public Result invoke(Invocation invocation) throws RpcException {
         ProfilerEntry originEntry = null;
         try {
+            // 如果开启了简易性能监控，则从invocation中提取并推进监控埋点
             if (ProfilerSwitch.isEnableSimpleProfiler()) {
                 Object fromInvocation = invocation.get(Profiler.PROFILER_KEY);
                 if (fromInvocation instanceof ProfilerEntry) {
@@ -97,25 +106,30 @@ public abstract class AbstractProxyInvoker<T> implements Invoker<T> {
                 }
             }
 
+            // 执行具体的代理方法调用（由子类实现），获取原始返回值
             Object value = doInvoke(
                     proxy, invocation.getMethodName(), invocation.getParameterTypes(), invocation.getArguments());
 
+            // 将原始返回值包装为CompletableFuture，并通过handle处理同步或异步产生的异常
             CompletableFuture<Object> future = wrapWithFuture(value, invocation);
             CompletableFuture<AppResponse> appResponseFuture = future.handle((obj, t) -> {
                 AppResponse result = new AppResponse(invocation);
                 if (t != null) {
+                    // 如果执行过程中抛出异常，解包CompletionException并设置到结果中
                     if (t instanceof CompletionException) {
                         result.setException(t.getCause());
                     } else {
                         result.setException(t);
                     }
                 } else {
+                    // 正常完成，设置业务返回值
                     result.setValue(obj);
                 }
                 return result;
             });
             return new AsyncRpcResult(appResponseFuture, invocation);
         } catch (InvocationTargetException e) {
+            // 处理目标方法执行期间抛出的检查型异常
             if (RpcContext.getServiceContext().isAsyncStarted()
                     && !RpcContext.getServiceContext().stopAsync()) {
                 logger.error(
@@ -127,11 +141,13 @@ public abstract class AbstractProxyInvoker<T> implements Invoker<T> {
             }
             return AsyncRpcResult.newDefaultAsyncResult(null, e.getTargetException(), invocation);
         } catch (Throwable e) {
+            // 捕获其他所有异常（如反射调用失败、参数不匹配等），包装为RpcException抛出
             throw new RpcException(
                     "Failed to invoke remote proxy method " + invocation.getMethodName() + " to " + getUrl()
                             + ", cause: " + e.getMessage(),
                     e);
         } finally {
+            // 结束性能监控埋点，并恢复之前的监控上下文状态
             if (ProfilerSwitch.isEnableSimpleProfiler()) {
                 Object fromInvocation = invocation.get(Profiler.PROFILER_KEY);
                 if (fromInvocation instanceof ProfilerEntry) {

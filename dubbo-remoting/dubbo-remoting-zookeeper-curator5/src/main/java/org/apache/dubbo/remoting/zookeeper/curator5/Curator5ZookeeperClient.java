@@ -350,6 +350,25 @@ public class Curator5ZookeeperClient
         return new Curator5ZookeeperClient.CuratorWatcherImpl(client, listener, path);
     }
 
+        /**
+     * 使用Curator5客户端为指定节点路径注册子节点变更监听器，并返回当前的子节点列表。
+     * <p>
+     * 该方法通过Curator的usingWatcher() API实现一次性监听器注册，当路径下的子节点发生增删时，
+     * listener会被触发一次通知。如果需要持续监听，监听器需要在回调中重新注册。
+     * </p>
+     * <p>
+     * 异常处理策略：
+     * <ul>
+     *   <li>NoNodeException：如果指定的路径在ZooKeeper中不存在，返回null而非抛出异常，允许调用方优雅处理节点未创建的场景</li>
+     *   <li>其他Exception：包装为IllegalStateException并重新抛出，确保网络异常、权限问题等能够被上层感知</li>
+     * </ul>
+     * </p>
+     *
+     * @param path ZooKeeper节点路径，如"/dubbo/com.example.Service/providers"
+     * @param listener Curator5封装的监听器实现，负责接收子节点变更事件并回调用户逻辑
+     * @return 当前路径下的所有子节点名称列表；如果节点不存在则返回null
+     * @throws IllegalStateException 当发生非NoNodeException的其他异常时抛出，包含原始错误信息
+     */
     @Override
     public List<String> addTargetChildListener(String path, CuratorWatcherImpl listener) {
         try {

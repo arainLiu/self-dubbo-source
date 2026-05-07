@@ -181,6 +181,15 @@ public abstract class DynamicDirectory<T> extends AbstractDirectory<T> implement
         return shouldRegister;
     }
 
+        /**
+     * 向注册中心订阅服务目录，注册当前目录对象作为通知监听者。
+     * <p>
+     * 该方法建立与注册中心的订阅关系，使得当服务提供者列表发生变化时（如新增、下线、配置变更等），
+     * 注册中心能够主动通知当前目录对象，触发服务列表的刷新和路由链的重建。
+     * </p>
+     *
+     * @param url 订阅URL，包含服务接口、版本、分组、协议等消费者配置信息
+     */
     public void subscribe(URL url) {
         setSubscribeUrl(url);
         registry.subscribe(url, this);
@@ -191,11 +200,39 @@ public abstract class DynamicDirectory<T> extends AbstractDirectory<T> implement
         registry.unsubscribe(url, this);
     }
 
+    /**
+     * 执行服务提供者列表的路由选择，根据路由规则过滤出可用的Invoker集合。
+     * <p>
+     * 该方法是集群容错的核心入口点，负责在每次RPC调用时动态筛选合适的服务提供者。
+     * 主要执行以下操作：
+     * <ol>
+     *   <li>检查服务是否被禁用（forbidden=true）且配置了快速失败（shouldFailFast=true），如果是则抛出RpcException，
+     *       提示用户检查服务提供者的状态（未注册、被禁用或在黑名单中）</li>
+     *   <li>如果是多分组场景（multiGroup=true），直接返回所有Invoker，跳过路由逻辑，支持跨分组调用</li>
+     *   <li>调用singleRouterChain.route()执行运行时路由规则，基于消费者URL、全量Invoker列表和调用参数进行过滤</li>
+     *   <li>如果路由结果为null，返回空列表；否则返回路由后的Invoker列表</li>
+     *   <li>如果路由过程发生异常，记录错误日志并返回空列表，避免单个路由规则失败影响整体调用</li>
+     * </ol>
+     * </p>
+     * <p>
+     * 路由链机制：singleRouterChain包含多个运行时路由器（如条件路由、标签路由、权重路由等），
+     * 这些路由器会按顺序执行，逐步缩小候选Invoker的范围，最终返回符合条件的服务提供者列表。
+     * </p>
+     *
+     * @param singleRouterChain 单次路由链对象，包含所有需要执行的路由规则
+     * @param invokers 完整的Invoker列表（BitList结构），作为路由的输入数据
+     * @param invocation RPC调用上下文，包含方法名、参数、附件等信息，供路由规则使用
+     * @return 经过路由过滤后的Invoker列表，如果没有可用的Invoker则返回空列表
+     * @throws RpcException 当服务被禁用且配置了快速失败时抛出FORBIDDEN_EXCEPTION
+     */
     @Override
     public List<Invoker<T>> doList(
             SingleRouterChain<T> singleRouterChain, BitList<Invoker<T>> invokers, Invocation invocation) {
         if (forbidden && shouldFailFast) {
             // 1. No service provider 2. Service providers are disabled
+            /*
+             * 服务被禁用场景：抛出快速失败异常，提示用户检查服务状态
+             */
             throw new RpcException(
                     RpcException.FORBIDDEN_EXCEPTION,
                     "No provider available from registry " + this
@@ -205,12 +242,18 @@ public abstract class DynamicDirectory<T> extends AbstractDirectory<T> implement
                             + ", please check status of providers(disabled, not registered or in blocklist).");
         }
 
+        /*
+         * 多分组场景：跳过路由逻辑，直接返回所有Invoker
+         */
         if (multiGroup) {
             return this.getInvokers();
         }
 
         try {
             // Get invokers from cache, only runtime routers will be executed.
+            /*
+             * 执行路由链，基于运行时规则过滤Invoker列表
+             */
             List<Invoker<T>> result = singleRouterChain.route(getConsumerUrl(), invokers, invocation);
             return result == null ? BitList.emptyList() : result;
         } catch (Throwable t) {
@@ -287,9 +330,26 @@ public abstract class DynamicDirectory<T> extends AbstractDirectory<T> implement
         }
     }
 
+        /**
+     * 基于指定的URL构建路由链，初始化所有激活的路由规则。
+     * <p>
+     * 该方法调用RouterChain.buildChain()静态方法，根据服务接口类型和URL中的配置参数（如条件路由、标签路由等），
+     * 加载并组装所有激活的路由器实例，形成完整的路由链。路由链会在每次RPC调用时执行，用于动态筛选合适的服务提供者。
+     * </p>
+     * <p>
+     * 典型使用场景：
+     * <ul>
+     *   <li>服务引用初始化时，根据消费者URL构建初始路由链</li>
+     *   <li>配置变更时（如新增路由规则），重新构建路由链以应用最新的路由策略</li>
+     * </ul>
+     * </p>
+     *
+     * @param url 包含路由配置的URL对象，通常为消费者URL或订阅URL
+     */
     public void buildRouterChain(URL url) {
         this.setRouterChain(RouterChain.buildChain(getInterface(), url));
     }
+
 
     @Override
     public boolean isAvailable() {

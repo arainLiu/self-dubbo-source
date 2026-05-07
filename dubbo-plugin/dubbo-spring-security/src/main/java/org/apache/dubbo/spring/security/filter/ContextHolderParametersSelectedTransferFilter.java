@@ -40,15 +40,34 @@ public class ContextHolderParametersSelectedTransferFilter implements ClusterFil
         return invoker.invoke(invocation);
     }
 
+    /**
+     * 将服务端上下文中的安全认证信息转移到调用对象中，实现跨层级的身份传递。
+     * <p>
+     * 该方法检查当前 RpcContext 的服务端附件中是否包含安全认证对象（Authentication）。
+     * 如果存在，则将其提取并设置到 Invocation 的对象附件中，确保在后续的远程调用或内部处理逻辑中，
+     * 安全上下文能够被正确感知和传播。如果未找到认证信息，则直接返回，不做任何处理。
+     * </p>
+     *
+     * @param invocation 当前的 RPC 调用对象，用于承载安全认证信息
+     */
     private void setSecurityContextIfExists(Invocation invocation) {
+        /*
+         * 获取当前线程 RpcContext 中的所有服务端附件信息
+         */
         Map<String, Object> resultMap = RpcContext.getServerAttachment().getObjectAttachments();
 
+        /*
+         * 尝试从附件中提取 Spring Security 的认证对象
+         */
         Object authentication = resultMap.get(SECURITY_AUTHENTICATION_CONTEXT_KEY);
 
         if (Objects.isNull(authentication)) {
             return;
         }
 
+        /*
+         * 将认证对象重新设置到 Invocation 的附件中，以便向下游传递
+         */
         invocation.setObjectAttachment(SecurityNames.SECURITY_AUTHENTICATION_CONTEXT_KEY, authentication);
     }
 }

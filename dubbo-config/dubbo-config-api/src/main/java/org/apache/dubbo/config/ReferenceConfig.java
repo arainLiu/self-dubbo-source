@@ -416,7 +416,7 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
                 serviceMetadata.setServiceType(getServiceInterfaceClass());
                 // TODO, uncomment this line once service key is unified
                 serviceMetadata.generateServiceKey();
-
+                //
                 Map<String, String> referenceParameters = appendConfig();
 
                 ModuleServiceRepository repository = getScopeModel().getServiceRepository();
@@ -509,9 +509,31 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
     }
 
     /**
-     * Append all configuration required for service reference.
+     * 组装服务引用所需的所有配置参数，生成用于创建Invoker的参数映射表。
+     * <p>
+     * 该方法按照优先级顺序将各层级配置合并到一个Map中，包括接口信息、运行时参数、版本信息、方法列表以及
+     * 来自Application、Module、Consumer和ReferenceConfig本身的配置项。同时处理特殊的系统属性（如注册IP）
+     * 和方法级别的配置转换（如retry到retries的映射）。
+     * </p>
+     * <p>
+     * 处理流程：
+     * <ol>
+     *   <li>放入基础参数：接口名称（interface）和端类型（side=consumer）</li>
+     *   <li>调用appendRuntimeParameters()添加PID、timestamp、pid等运行时参数</li>
+     *   <li>如果不是泛化调用：
+     *     <ul>
+     *       <li>计算接口的版本号（revision）并放入map</li>
+     *       <li>提取接口中的所有方法名，如果为空则使用"*"通配符，否则用逗号分隔所有方法名</li>
+     *     </ul>
+     *   </li>
+     *   <li>依次合并Application、Module、Consumer和ReferenceConfig的配置参数到map中</li>
+     *   <li>确定注册IP地址：优先使用DUBBO_IP_TO_REGISTRY系统属性，如果未设置则使用本地主机地址，
+     *       如果设置了非法的本地地址则抛出异常</li>
+     *   <li>遍历MethodConfig配置，将方法级参数添加到map中（前缀为方法名），并将retry=false转换为retries=0</li>
+     * </ol>
+     * </p>
      *
-     * @return reference parameters
+     * @return 包含所有服务引用配置参数的Map对象，key为参数名，value为参数值
      */
     private Map<String, String> appendConfig() {
         Map<String, String> map = new HashMap<>(16);
@@ -522,6 +544,9 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
         ReferenceConfigBase.appendRuntimeParameters(map);
 
         if (!ProtocolUtils.isGeneric(generic)) {
+            /*
+             * 非泛化调用场景：添加版本号和方法列表信息
+             */
             String revision = Version.getVersion(interfaceClass, version);
             if (StringUtils.isNotEmpty(revision)) {
                 map.put(REVISION_KEY, revision);
@@ -540,11 +565,17 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
             }
         }
 
+        /*
+         * 按层级合并配置参数：Application -> Module -> Consumer -> ReferenceConfig
+         */
         AbstractConfig.appendParameters(map, getApplication());
         AbstractConfig.appendParameters(map, getModule());
         AbstractConfig.appendParameters(map, consumer);
         AbstractConfig.appendParameters(map, this);
 
+        /*
+         * 确定注册IP地址：优先使用系统属性，其次使用本地主机地址，并进行合法性校验
+         */
         String hostToRegistry = ConfigUtils.getSystemProperty(DUBBO_IP_TO_REGISTRY);
         if (StringUtils.isEmpty(hostToRegistry)) {
             hostToRegistry = NetUtils.getLocalHost();
@@ -555,9 +586,15 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
 
         map.put(REGISTER_IP_KEY, hostToRegistry);
 
+        /*
+         * 处理方法级别的配置，将MethodConfig转换为URL参数格式
+         */
         if (CollectionUtils.isNotEmpty(getMethods())) {
             for (MethodConfig methodConfig : getMethods()) {
                 AbstractConfig.appendParameters(map, methodConfig, methodConfig.getName());
+                /*
+                 * 将retry=false转换为retries=0，兼容不同的配置方式
+                 */
                 String retryKey = methodConfig.getName() + ".retry";
                 if (map.containsKey(retryKey)) {
                     String retryValue = map.remove(retryKey);
@@ -756,13 +793,41 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
     }
 
     /**
-     * Get URLs from the registry and aggregate them.
+     * 从注册中心加载URL列表并进行聚合处理，构建最终的服务引用地址集合。
+     * <p>
+     * 该方法负责将注册中心地址与服务引用参数结合，生成用于发起远程调用的完整URL列表。
+     * 支持多注册中心场景，会为每个注册中心生成一个带有引用参数的URL。
+     * 如果未配置注册中心或注册中心列表为空，且满足JVM内部调用条件，则使用injvm协议进行本地调用。
+     * </p>
+     * <p>
+     * 处理流程：
+     * <ol>
+     *   <li>检查注册中心配置的合法性</li>
+     *   <li>加载所有注册的URL列表（consumer端地址）</li>
+     *   <li>遍历每个注册中心URL：
+     *     <ul>
+     *       <li>加载监控中心配置并作为属性附加到URL上</li>
+     *       <li>设置ScopeModel和ServiceModel，用于后续的模型隔离和服务治理</li>
+     *       <li>如果配置了injvm优先，则添加local.protocol=true参数</li>
+     *       <li>将referenceParameters作为REFER_KEY属性存储到URL中，供后续创建Invoker时使用</li>
+     *     </ul>
+     *   </li>
+     *   <li>如果URL列表仍为空且满足JVM引用条件（如服务仅在本地发布），创建injvm协议的本地调用URL</li>
+     *   <li>如果最终URL列表仍为空，抛出IllegalStateException提示用户配置注册中心</li>
+     * </ol>
+     * </p>
+     *
+     * @param referenceParameters 服务引用的配置参数映射表，包含接口名、版本、分组、超时时间等信息
+     * @throws IllegalStateException 当没有任何可用的注册中心且无法使用JVM内部调用时抛出
      */
     private void aggregateUrlFromRegistry(Map<String, String> referenceParameters) {
         checkRegistry();
         List<URL> us = ConfigValidationUtils.loadRegistries(this, false);
         if (CollectionUtils.isNotEmpty(us)) {
             for (URL u : us) {
+                /*
+                 * 为每个注册中心URL附加监控中心、作用域模型、服务模型和引用参数等元数据
+                 */
                 URL monitorUrl = ConfigValidationUtils.loadMonitor(this, u);
                 if (monitorUrl != null) {
                     u = u.putAttribute(MONITOR_KEY, monitorUrl);
@@ -775,6 +840,9 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
                 urls.add(u.putAttribute(REFER_KEY, referenceParameters));
             }
         }
+        /*
+         * 如果没有注册中心URL且满足JVM内部引用条件，则创建本地调用URL
+         */
         if (urls.isEmpty() && shouldJvmRefer(referenceParameters)) {
             URL injvmUrl = new URL(LOCAL_PROTOCOL, LOCALHOST_VALUE, 0, interfaceClass.getName())
                     .addParameters(referenceParameters);
@@ -949,9 +1017,31 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
         }
     }
 
-    /**
-     * This method should be called right after the creation of this class's instance, before any property in other config modules is used.
-     * Check each config modules are created properly and override their properties if necessary.
+        /**
+     * 检查并更新引用配置的子配置项，确保所有相关配置模块已正确初始化并处理属性覆盖。
+     * <p>
+     * 该方法必须在ReferenceConfig实例创建后立即调用，在使用其他配置模块的任何属性之前完成所有配置的初始化和校验。
+     * 主要执行以下操作：
+     * <ol>
+     *   <li>验证interfaceName不能为空，否则抛出IllegalStateException</li>
+     *   <li>调用completeCompoundConfigs()补全组合配置，从全局配置中继承缺失的属性</li>
+     *   <li>加载并执行ConfigInitializer扩展，对引用配置进行额外的初始化处理</li>
+     *   <li>处理泛化调用配置：
+     *     <ul>
+     *       <li>如果generic未设置但consumer存在，则从consumer继承generic属性</li>
+     *       <li>如果是泛化调用（generic为true或"nativejava"等），将interfaceClass设置为GenericService.class，
+     *           并记录与原有interfaceClass冲突的警告日志</li>
+     *       <li>如果不是泛化调用，则根据interfaceName加载实际的接口类，优先使用getInterfaceClassLoader()，
+     *           否则使用线程上下文类加载器</li>
+     *     </ul>
+     *   </li>
+     *   <li>检查Stub和Local配置的有效性</li>
+     *   <li>如果url未配置，则调用checkRegistry()检查注册中心配置</li>
+     *   <li>调用resolveFile()解析本地配置文件的直连地址</li>
+     *   <li>调用ConfigValidationUtils.validateReferenceConfig()进行完整的配置校验</li>
+     *   <li>调用postProcessConfig()执行配置后处理逻辑</li>
+     * </ol>
+     * </p>
      */
     protected void checkAndUpdateSubConfigs() {
         if (StringUtils.isEmpty(interfaceName)) {
@@ -959,9 +1049,15 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
         }
 
         // get consumer's global configuration
+        /*
+         * 补全组合配置，从全局消费者配置中继承缺失的属性
+         */
         completeCompoundConfigs();
 
         // init some null configuration.
+        /*
+         * 加载并执行ConfigInitializer扩展，对引用配置进行额外初始化
+         */
         List<ConfigInitializer> configInitializers = this.getExtensionLoader(ConfigInitializer.class)
                 .getActivateExtension(URL.valueOf("configInitializer://"), (String[]) null);
         configInitializers.forEach(e -> e.initReferConfig(this));
@@ -970,6 +1066,9 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
             setGeneric(getConsumer().getGeneric());
         }
         if (ProtocolUtils.isGeneric(generic)) {
+            /*
+             * 泛化调用场景：将interfaceClass设置为GenericService，并记录类型冲突警告
+             */
             if (interfaceClass != null && !interfaceClass.equals(GenericService.class)) {
                 logger.warn(
                         CONFIG_PROPERTY_CONFLICT,
@@ -987,6 +1086,9 @@ public class ReferenceConfig<T> extends ReferenceConfigBase<T> {
             }
             interfaceClass = GenericService.class;
         } else {
+            /*
+             * 非泛化调用场景：加载实际的接口类
+             */
             try {
                 if (getInterfaceClassLoader() != null
                         && (interfaceClass == null || interfaceClass.getClassLoader() != getInterfaceClassLoader())) {

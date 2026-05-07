@@ -39,6 +39,34 @@ public class JavassistProxyFactory extends AbstractProxyFactory {
             LoggerFactory.getErrorTypeAwareLogger(JavassistProxyFactory.class);
     private final JdkProxyFactory jdkProxyFactory = new JdkProxyFactory();
 
+    /**
+     * 使用Javassist创建服务代理对象，支持自动降级到JDK动态代理。
+     * <p>
+     * 该方法优先使用Javassist字节码技术生成高性能的代理对象，如果生成失败则自动回退到JDK原生动态代理机制，
+     * 确保在各种复杂场景下（如接口包含特殊方法、类加载器冲突等）都能成功创建代理。
+     * </p>
+     * <p>
+     * 处理流程：
+     * <ol>
+     *   <li>调用Proxy.getProxy()获取指定接口集合的Javassist代理类，并传入InvokerInvocationHandler创建代理实例</li>
+     *   <li>如果Javassist创建失败，捕获异常并尝试使用JDK动态代理作为备选方案：
+     *     <ul>
+     *       <li>调用jdkProxyFactory.getProxy()创建JDK代理，如果成功则记录错误日志并返回代理对象</li>
+     *       <li>如果JDK代理也失败，分别记录Javassist和JDK的错误日志，最后抛出原始的Javassist异常</li>
+     *     </ul>
+     *   </li>
+     * </ol>
+     * </p>
+     * <p>
+     * 这种双重保障机制提高了系统的健壮性：Javassist提供了更高的运行时性能（通过字节码生成避免反射开销），
+     * 而JDK代理作为标准实现能够处理一些Javassist可能不支持的边缘情况。
+     * </p>
+     *
+     * @param invoker 服务调用的Invoker对象，封装了远程调用逻辑
+     * @param interfaces 代理需要实现的接口数组，包含业务接口和框架内部接口
+     * @return 创建的服务代理对象，实现了所有指定的接口
+     * @throws Throwable 当Javassist和JDK代理都创建失败时，抛出Javassist的原始异常
+     */
     @Override
     @SuppressWarnings("unchecked")
     public <T> T getProxy(Invoker<T> invoker, Class<?>[] interfaces) {
@@ -47,6 +75,9 @@ public class JavassistProxyFactory extends AbstractProxyFactory {
         } catch (Throwable fromJavassist) {
             // try fall back to JDK proxy factory
             try {
+                /*
+                 * Javassist失败时，降级使用JDK动态代理
+                 */
                 T proxy = jdkProxyFactory.getProxy(invoker, interfaces);
                 logger.error(
                         PROXY_FAILED,
@@ -57,6 +88,9 @@ public class JavassistProxyFactory extends AbstractProxyFactory {
                         fromJavassist);
                 return proxy;
             } catch (Throwable fromJdk) {
+                /*
+                 * JDK代理也失败时，记录两种方式的错误日志并抛出原始异常
+                 */
                 logger.error(
                         PROXY_FAILED,
                         "",

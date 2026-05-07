@@ -80,6 +80,25 @@ public class RegistryManager {
         registries.put(key, registry);
     }
 
+        /**
+     * 获取所有服务发现组件的列表，用于执行服务实例的注册、更新和查询操作。
+     * <p>
+     * 该方法从当前注册管理器维护的所有注册中心中筛选出ServiceDiscoveryRegistry类型的注册中心，
+     * 并提取其关联的ServiceDiscovery对象。这些服务发现组件负责与应用级服务注册发现机制交互，
+     * 管理服务实例的生命周期和元数据信息。
+     * </p>
+     * <p>
+     * 处理流程：
+     * <ol>
+     *   <li>调用getRegistries()获取所有已创建的注册中心实例</li>
+     *   <li>过滤出类型为ServiceDiscoveryRegistry的注册中心（支持应用级服务发现的注册中心）</li>
+     *   <li>将ServiceDiscoveryRegistry转换为对应的ServiceDiscovery对象</li>
+     *   <li>收集所有ServiceDiscovery对象并返回列表</li>
+     * </ol>
+     * </p>
+     *
+     * @return 包含所有ServiceDiscovery对象的列表，如果没有任何ServiceDiscoveryRegistry则返回空列表
+     */
     public List<ServiceDiscovery> getServiceDiscoveries() {
         return getRegistries().stream()
                 .filter(registry -> registry instanceof ServiceDiscoveryRegistry)

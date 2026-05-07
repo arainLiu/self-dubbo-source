@@ -102,8 +102,36 @@ public abstract class AbstractProxyProtocol extends AbstractProtocol {
         return exporter;
     }
 
+        /**
+     * 创建基于代理协议的服务引用Invoker，封装远程调用逻辑和异常处理。
+     * <p>
+     * 该方法通过以下步骤构建服务引用的调用链：
+     * <ol>
+     *   <li>调用doRefer()获取底层的代理对象，再通过proxyFactory包装成Invoker</li>
+     *   <li>创建一个匿名的AbstractInvoker实例，重写doInvoke()和destroy()方法</li>
+     *   <li>在doInvoke()中执行目标Invoker的调用，并对结果进行异常处理和转换</li>
+     *   <li>将创建的Invoker添加到invokers集合中进行统一管理</li>
+     * </ol>
+     * </p>
+     * <p>
+     * 异常处理策略：
+     * <ul>
+     *   <li>如果调用结果包含异常，且异常类型匹配rpcExceptions集合中的某个类，则转换为RpcException抛出</li>
+     *   <li>如果捕获到RpcException且错误码为UNKNOWN_EXCEPTION，则根据cause重新设置错误码</li>
+     *   <li>其他Throwable统一通过getRpcException()方法转换为RpcException</li>
+     * </ul>
+     * </p>
+     *
+     * @param type 服务接口类型，表示要引用的服务的契约
+     * @param url 服务URL，包含注册地址、协议、参数等信息
+     * @return 创建的Invoker对象，用于发起远程RPC调用
+     * @throws RpcException 当服务引用创建或调用失败时抛出
+     */
     @Override
     protected <T> Invoker<T> protocolBindingRefer(final Class<T> type, final URL url) throws RpcException {
+        /*
+         * 通过代理工厂获取底层代理对象的Invoker包装
+         */
         final Invoker<T> target = proxyFactory.getInvoker(doRefer(type, url), type, url);
         Invoker<T> invoker = new AbstractInvoker<T>(type, url) {
             @Override
@@ -113,6 +141,9 @@ public abstract class AbstractProxyProtocol extends AbstractProtocol {
                     // FIXME result is an AsyncRpcResult instance.
                     Throwable e = result.getException();
                     if (e != null) {
+                        /*
+                         * 检查异常类型是否匹配配置的rpcExceptions，如果匹配则转换为RpcException
+                         */
                         for (Class<?> rpcException : rpcExceptions) {
                             if (rpcException.isAssignableFrom(e.getClass())) {
                                 throw getRpcException(type, url, invocation, e);
@@ -121,6 +152,9 @@ public abstract class AbstractProxyProtocol extends AbstractProtocol {
                     }
                     return result;
                 } catch (RpcException e) {
+                    /*
+                     * 对于未知类型的RpcException，根据cause重新设置错误码
+                     */
                     if (e.getCode() == RpcException.UNKNOWN_EXCEPTION) {
                         e.setCode(getErrorCode(e.getCause()));
                     }
@@ -132,6 +166,9 @@ public abstract class AbstractProxyProtocol extends AbstractProtocol {
 
             @Override
             public void destroy() {
+                /*
+                 * 销毁Invoker时清理资源，包括目标Invoker、从集合中移除自身以及执行协议内部的销毁逻辑
+                 */
                 super.destroy();
                 target.destroy();
                 invokers.remove(this);
@@ -141,6 +178,7 @@ public abstract class AbstractProxyProtocol extends AbstractProtocol {
         invokers.add(invoker);
         return invoker;
     }
+
 
     // used to destroy unused clients and other resource
     protected void destroyInternal(URL url) {

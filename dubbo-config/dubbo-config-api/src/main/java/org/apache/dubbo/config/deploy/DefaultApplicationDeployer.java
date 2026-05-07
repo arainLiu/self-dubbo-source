@@ -826,6 +826,25 @@ public class DefaultApplicationDeployer extends AbstractDeployer<ApplicationMode
         doExportMetadataService();
     }
 
+    /**
+     * 准备并启动应用的内建模块（Internal Module），确保内建服务在普通模块之前就绪。
+     * <p>
+     * 内建模块包含Dubbo框架的核心基础设施服务（如元数据服务、配置中心等），需要在用户自定义模块启动前完成初始化。
+     * 该方法采用双重检查锁定（DCL）模式保证线程安全，并确保内建模块只被启动一次。
+     * </p>
+     * <p>
+     * 处理流程：
+     * <ol>
+     *   <li>首次检查hasPreparedInternalModule标志，如果已准备则直接返回，避免重复执行</li>
+     *   <li>进入同步块，再次检查标志位，确保并发场景下的安全性</li>
+     *   <li>获取内建模块的部署器，检查其是否已完成启动</li>
+     *   <li>如果未完成，调用start()异步启动内建模块</li>
+     *   <li>阻塞等待最多5秒，直到内建模块启动完成</li>
+     *   <li>启动成功后设置hasPreparedInternalModule标志为true</li>
+     *   <li>如果等待超时或启动失败，记录警告日志但不中断流程，允许后续逻辑继续执行</li>
+     * </ol>
+     * </p>
+     */
     public void prepareInternalModule() {
         if (hasPreparedInternalModule) {
             return;
@@ -836,11 +855,17 @@ public class DefaultApplicationDeployer extends AbstractDeployer<ApplicationMode
             }
 
             // start internal module
+            /*
+             * 获取内建模块的部署器，并检查其启动状态
+             */
             ModuleDeployer internalModuleDeployer =
                     applicationModel.getInternalModule().getDeployer();
             if (!internalModuleDeployer.isCompletion()) {
                 Future future = internalModuleDeployer.start();
                 // wait for internal module startup
+                /*
+                 * 阻塞等待内建模块启动完成，最多等待5秒
+                 */
                 try {
                     future.get(5, TimeUnit.SECONDS);
                     hasPreparedInternalModule = true;
@@ -1074,6 +1099,22 @@ public class DefaultApplicationDeployer extends AbstractDeployer<ApplicationMode
         }
     }
 
+        /**
+     * 刷新服务实例信息和元数据，确保注册中心持有最新的服务状态。
+     * <p>
+     * 该方法仅在应用已成功注册到注册中心后才会执行刷新操作。如果应用尚未注册（registered为false），
+     * 则直接跳过，避免在实例未就绪时触发无效的更新。
+     * </p>
+     * <p>
+     * 刷新逻辑委托给ServiceInstanceMetadataUtils.refreshMetadataAndInstance()方法，
+     * 该方法会遍历所有的服务发现组件并触发其更新操作，包括重新计算实例版本号（revision）
+     * 和同步最新的元数据信息。
+     * </p>
+     * <p>
+     * 异常处理：所有异常都会被捕获并记录错误日志，不会中断业务流程，
+     * 因为实例刷新是辅助性操作，不影响核心的服务调用功能。
+     * </p>
+     */
     @Override
     public void refreshServiceInstance() {
         if (registered) {

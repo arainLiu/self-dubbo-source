@@ -55,10 +55,32 @@ public class Proxy {
     }
 
     /**
-     * Get proxy.
+     * 获取指定接口集合的代理对象实例，使用双层缓存机制优化性能。
+     * <p>
+     * 该方法负责根据传入的接口数组生成或从缓存中获取对应的Proxy对象。为了确保同一组接口在同一个类加载器下只会被生成一次代理类，
+     * 采用了基于ClassLoader和接口签名的两级缓存策略：第一级以ClassLoader为键区分不同的隔离环境，第二级以接口签名组合为键存储具体的Proxy实例。
+     * </p>
+     * <p>
+     * 处理流程：
+     * <ol>
+     *   <li>检查接口数量是否超过MAX_PROXY_COUNT限制，防止因接口过多导致生成的代理类过大</li>
+     *   <li>提取第一个接口的ClassLoader和ProtectionDomain，用于后续代理类的定义和权限控制</li>
+     *   <li>调用buildInterfacesKey()生成唯一的缓存键，包含所有接口的全限定名</li>
+     *   <li>从PROXY_CACHE_MAP中根据ClassLoader获取或创建二级缓存Map（ConcurrentHashMap）</li>
+     *   <li>尝试从二级缓存中获取Proxy实例，如果命中则直接返回</li>
+     *   <li>如果缓存未命中，进入同步块进行双重检查锁定（DCL）：
+     *     <ul>
+     *       <li>再次检查缓存，避免并发场景下的重复创建</li>
+     *       <li>调用buildProxyClass()动态构建代理类的字节码并生成Class对象</li>
+     *       <li>将新创建的Proxy实例存入缓存，供后续请求复用</li>
+     *     </ul>
+     *   </li>
+     * </ol>
+     * </p>
      *
-     * @param ics interface class array.
-     * @return Proxy instance.
+     * @param ics 需要代理的接口类数组，不能为空，且总数量不能超过MAX_PROXY_COUNT
+     * @return 对应的Proxy实例，要么是新生成的，要么是从缓存中获取的
+     * @throws IllegalArgumentException 当接口数量超过系统限制时抛出
      */
     public static Proxy getProxy(Class<?>... ics) {
         if (ics.length > MAX_PROXY_COUNT) {
@@ -66,15 +88,24 @@ public class Proxy {
         }
 
         // ClassLoader from App Interface should support load some class from Dubbo
+        /*
+         * 提取类加载器和保护域，用于后续代理类的定义
+         */
         ClassLoader cl = ics[0].getClassLoader();
         ProtectionDomain domain = ics[0].getProtectionDomain();
 
         // use interface class name list as key.
+        /*
+         * 基于接口签名生成唯一的缓存键
+         */
         String key = buildInterfacesKey(cl, ics);
 
         // get cache by class loader.
         final Map<String, Proxy> cache;
         synchronized (PROXY_CACHE_MAP) {
+            /*
+             * 获取或创建基于ClassLoader的二级缓存Map
+             */
             cache = PROXY_CACHE_MAP.computeIfAbsent(cl, k -> new ConcurrentHashMap<>());
         }
 
@@ -83,7 +114,9 @@ public class Proxy {
             synchronized (ics[0]) {
                 proxy = cache.get(key);
                 if (proxy == null) {
-                    // create Proxy class.
+                    /*
+                     * 缓存未命中时，动态构建代理类并放入缓存
+                     */
                     proxy = new Proxy(buildProxyClass(cl, ics, domain));
                     cache.put(key, proxy);
                 }

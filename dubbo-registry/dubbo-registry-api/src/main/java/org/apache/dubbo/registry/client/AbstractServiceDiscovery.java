@@ -218,9 +218,26 @@ public abstract class AbstractServiceDiscovery implements ServiceDiscovery {
     }
 
     /**
-     * Update assumes that DefaultServiceInstance and its attributes will never get updated once created.
-     * Checking hasExportedServices() before registration guarantees that at least one service is ready for creating the
-     * instance.
+     * 更新服务实例的元数据和版本信息，确保注册中心持有最新的服务实例状态。
+     * <p>
+     * 该方法基于"DefaultServiceInstance及其属性一旦创建就不会被修改"的假设，采用不可变对象模式：
+     * 当需要更新时，创建一个新的实例副本并计算其版本号（revision），如果版本号发生变化则执行更新。
+     * </p>
+     * <p>
+     * 处理流程：
+     * <ol>
+     *   <li>检查销毁状态，如果已销毁则直接返回</li>
+     *   <li>如果服务实例尚未创建，调用register()方法进行初始化注册</li>
+     *   <li>验证当前服务实例的有效性，无效则跳过更新</li>
+     *   <li>基于旧实例创建新的DefaultServiceInstance副本</li>
+     *   <li>计算或更新新实例的版本号（revision），如果元数据变化则返回true</li>
+     *   <li>如果版本号发生变化，记录日志并调用doUpdate()执行实际的更新操作，最后替换引用</li>
+     * </ol>
+     * </p>
+     * <p>
+     * 线程安全：使用synchronized关键字保证同一时间只有一个线程能执行更新逻辑，
+     * 避免并发更新导致的实例状态不一致问题。
+     * </p>
      */
     @Override
     public synchronized void update() throws RuntimeException {
@@ -228,6 +245,9 @@ public abstract class AbstractServiceDiscovery implements ServiceDiscovery {
             return;
         }
 
+        /*
+         * 如果服务实例尚未创建，则先执行注册操作
+         */
         if (this.serviceInstance == null) {
             register();
         }
@@ -236,6 +256,9 @@ public abstract class AbstractServiceDiscovery implements ServiceDiscovery {
             return;
         }
         ServiceInstance oldServiceInstance = this.serviceInstance;
+        /*
+         * 基于旧实例创建新的不可变副本，准备进行版本比对
+         */
         DefaultServiceInstance newServiceInstance =
                 new DefaultServiceInstance((DefaultServiceInstance) oldServiceInstance);
         boolean revisionUpdated = calOrUpdateInstanceRevision(newServiceInstance);
@@ -457,6 +480,22 @@ public abstract class AbstractServiceDiscovery implements ServiceDiscovery {
 
     protected abstract void doDestroy() throws Exception;
 
+        /**
+     * 创建服务实例对象，初始化元数据信息和自定义属性。
+     * <p>
+     * 该方法负责构建一个完整的DefaultServiceInstance实例，并为其配置必要的元数据和扩展属性。
+     * 主要执行以下操作：
+     * <ol>
+     *   <li>基于服务名称和应用模型创建默认的ServiceInstance实例</li>
+     *   <li>将传入的MetadataInfo（包含服务的接口、方法、参数等完整契约信息）设置到实例中</li>
+     *   <li>根据metadataType配置元数据的存储类型（如remote表示存储到远程元数据中心）</li>
+     *   <li>调用customizeInstance()允许通过扩展点对实例进行自定义处理，例如添加额外的标签或属性</li>
+     * </ol>
+     * </p>
+     *
+     * @param metadataInfo 服务的完整元数据信息，包括接口定义、方法签名、参数类型等
+     * @return 创建并初始化完成的DefaultServiceInstance对象
+     */
     protected ServiceInstance createServiceInstance(MetadataInfo metadataInfo) {
         DefaultServiceInstance instance = new DefaultServiceInstance(serviceName, applicationModel);
         instance.setServiceMetadata(metadataInfo);
@@ -465,10 +504,35 @@ public abstract class AbstractServiceDiscovery implements ServiceDiscovery {
         return instance;
     }
 
+
+        /**
+     * 计算并更新服务实例的版本号（revision），检测元数据是否发生变化。
+     * <p>
+     * 该方法通过比对当前实例存储的版本号与根据最新元数据计算出的版本号，判断服务元数据是否发生变更。
+     * 如果版本号不一致，说明服务的接口、方法或配置发生了变化，此时会更新实例元数据中的版本号，
+     * 并返回true通知调用者需要执行实例更新操作。
+     * </p>
+     * <p>
+     * Revision是服务元数据的指纹标识，基于MetadataInfo中的所有服务URL、方法签名、参数类型等信息计算得出。
+     * 当任何元数据发生变化时，revision值都会改变，从而触发服务发现的更新机制。
+     * </p>
+     *
+     * @param instance 要检查或更新版本号的服务实例对象
+     * @return 如果版本号发生变化（元数据已更新）则返回true，否则返回false
+     */
     protected boolean calOrUpdateInstanceRevision(ServiceInstance instance) {
+        /*
+         * 获取实例当前存储的旧版本号
+         */
         String existingInstanceRevision = getExportedServicesRevision(instance);
         MetadataInfo metadataInfo = instance.getServiceMetadata();
+        /*
+         * 根据最新的元数据信息重新计算版本号
+         */
         String newRevision = metadataInfo.calAndGetRevision();
+        /*
+         * 比对新旧版本号，如果不一致则更新实例元数据中的版本号并返回true
+         */
         if (!newRevision.equals(existingInstanceRevision)) {
             instance.getMetadata().put(EXPORTED_SERVICES_REVISION_PROPERTY_NAME, metadataInfo.getRevision());
             return true;

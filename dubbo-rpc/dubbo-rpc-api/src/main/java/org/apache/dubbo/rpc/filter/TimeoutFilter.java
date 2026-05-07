@@ -45,11 +45,22 @@ public class TimeoutFilter implements Filter, Filter.Listener {
         return invoker.invoke(invocation);
     }
 
+    /**
+     * 处理响应时的超时检查逻辑
+     * 从服务端上下文中获取超时倒计时器，如果调用已超时则记录警告日志
+     *
+     * @param appResponse RPC调用的应用层响应结果
+     * @param invoker 调用器对象，用于获取URL配置信息
+     * @param invocation 调用上下文对象，包含方法名等元数据
+     */
     @Override
     public void onResponse(Result appResponse, Invoker<?> invoker, Invocation invocation) {
+        // 从服务端附件中获取超时倒计时器对象
         Object obj = RpcContext.getServerAttachment().getObjectAttachment(TIME_COUNTDOWN_KEY);
         if (obj != null) {
             TimeoutCountDown countDown = (TimeoutCountDown) obj;
+
+            // 检查调用是否已经超时，如果超时则记录警告日志
             if (countDown.isExpired()) {
                 if (logger.isWarnEnabled()) {
                     logger.warn(

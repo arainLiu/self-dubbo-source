@@ -72,23 +72,42 @@ public class RestExtensionExecutionFilter extends RestFilterAdapter {
         extensionAdapters = (List) applicationModel.getActivateExtensions(RestExtensionAdapter.class);
     }
 
+    /**
+     * 执行REST扩展过滤器链，处理HTTP请求和响应
+     * 根据请求路径匹配适用的过滤器，构建过滤器链并执行，最后处理不同类型的响应结果
+     *
+     * @param invoker 服务调用器，用于获取过滤器配置和执行最终调用
+     * @param invocation 调用上下文对象，用于存储过滤器链信息
+     * @param request HTTP请求对象，包含请求路径等信息用于过滤器匹配
+     * @param response HTTP响应对象，用于承载处理结果
+     * @return RPC调用结果，可能为同步或异步结果
+     * @throws RpcException 当RPC调用过程中发生异常时抛出
+     */
     @Override
     protected Result invoke(Invoker<?> invoker, Invocation invocation, HttpRequest request, HttpResponse response)
             throws RpcException {
+        // 根据请求路径匹配适用的REST过滤器，并构建过滤器链
         RestFilter[] filters = matchFilters(getFilters(invoker), request.path());
         DefaultFilterChain chain = new DefaultFilterChain(filters, invocation, () -> invoker.invoke(invocation));
+
+        // 将过滤器链存入invocation上下文，供后续环节使用
         invocation.put(KEY, chain);
         try {
+            // 执行过滤器链，获取初步执行结果
             Result result = chain.execute(request, response);
             if (result != null) {
                 return result;
             }
+
+            // 从响应体中提取最终结果，并根据类型进行差异化处理
             Object body = response.body();
             if (body instanceof Throwable) {
+                // 如果响应体是异常对象，则清除响应体并返回异步异常结果
                 response.setBody(null);
                 return AsyncRpcResult.newDefaultAsyncResult((Throwable) body, invocation);
             }
             if (body instanceof CompletableFuture) {
+                // 如果响应体是CompletableFuture，则将其转换为AsyncRpcResult进行异步处理
                 CompletableFuture<?> future = (CompletableFuture<?>) body;
                 response.setBody(null);
                 return new AsyncRpcResult(
@@ -103,29 +122,51 @@ public class RestExtensionExecutionFilter extends RestFilterAdapter {
                         }),
                         invocation);
             }
+
+            // 默认情况下返回空的异步成功结果
             return AsyncRpcResult.newDefaultAsyncResult(invocation);
         } catch (Throwable t) {
+            // 捕获所有异常并包装为RpcException抛出
             throw ExceptionUtils.wrap(t);
         }
     }
 
+
+    /**
+     * 处理REST过滤器链的响应结果，将HttpResponse中的内容同步回Result对象
+     * 在调用链执行完毕后，触发过滤器的后置处理逻辑，并根据响应体更新最终结果
+     *
+     * @param result RPC调用的应用层响应结果，用于接收最终的返回值或异常
+     * @param invoker 服务调用器，提供调用上下文
+     * @param invocation 调用上下文对象，用于获取之前存储的过滤器链
+     * @param request HTTP请求对象，传递给过滤器链进行后置处理
+     * @param response HTTP响应对象，从中提取处理后的业务数据
+     */
     @Override
     protected void onResponse(
             Result result, Invoker<?> invoker, Invocation invocation, HttpRequest request, HttpResponse response) {
+        // 从invocation中获取之前构建的过滤器链，若不存在则直接返回
         DefaultFilterChain chain = (DefaultFilterChain) invocation.get(KEY);
         if (chain == null) {
             return;
         }
+
+        // 执行过滤器链的后置处理逻辑（onResponse阶段）
         chain.onResponse(result, request, response);
+
+        // 如果调用结果包含异常，尝试从response body中提取更准确的异常或返回值
         if (result.hasException()) {
             Object body = response.body();
             if (body != null) {
                 if (body instanceof Throwable) {
+                    // 如果响应体是异常对象，则更新result中的异常信息
                     result.setException((Throwable) body);
                 } else {
+                    // 如果响应体是正常业务数据，则将其设为返回值并清除异常状态
                     result.setValue(body);
                     result.setException(null);
                 }
+                // 清空response body，避免数据重复处理
                 response.setBody(null);
             }
         }

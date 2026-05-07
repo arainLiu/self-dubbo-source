@@ -592,6 +592,24 @@ public class DubboProtocol extends AbstractProtocol {
         return protocolBindingRefer(type, url);
     }
 
+        /**
+     * 创建基于Dubbo协议的RPC调用Invoker，负责建立网络连接并管理序列化优化。
+     * <p>
+     * 该方法是Dubbo协议消费者端的核心入口，主要执行以下操作：
+     * <ol>
+     *   <li>检查协议层是否已销毁，确保在关闭状态下不再创建新的Invoker</li>
+     *   <li>调用optimizeSerialization()加载并注册URL中配置的序列化优化器（如Kryo、FST等），提升后续调用的序列化性能</li>
+     *   <li>调用getClients(url)获取或创建与提供者通信的ExchangeClient数组（支持单连接或多连接配置）</li>
+     *   <li>创建DubboInvoker实例，封装服务类型、URL、客户端连接集合以及全局Invoker列表引用</li>
+     *   <li>将新创建的Invoker添加到invokers集合中进行统一管理，便于后续的资源清理和生命周期控制</li>
+     * </ol>
+     * </p>
+     *
+     * @param serviceType 服务接口类型，表示要引用的远程服务契约
+     * @param url 服务URL，包含提供者地址、端口、协议版本、序列化方式等配置信息
+     * @return 创建的DubboInvoker对象，用于发起基于Dubbo协议的远程RPC调用
+     * @throws RpcException 当协议已销毁或创建连接失败时抛出
+     */
     @Override
     public <T> Invoker<T> protocolBindingRefer(Class<T> serviceType, URL url) throws RpcException {
         checkDestroyed();
@@ -604,6 +622,22 @@ public class DubboProtocol extends AbstractProtocol {
         return invoker;
     }
 
+
+    /**
+     * 根据URL配置获取客户端连接提供者，支持共享连接和独占连接两种模式。
+     * <p>
+     * 该方法负责决定消费者与提供者之间建立的网络连接策略：
+     * <ul>
+     *   <li><b>共享连接模式</b>（connections=0或未配置）：多个服务接口复用同一组物理连接，减少资源占用。
+     *       连接数量由share.connections参数控制，优先从URL参数读取，其次从系统属性或配置文件获取，默认值为1。</li>
+     *   <li><b>独占连接模式</b>（connections>0）：为当前服务单独创建指定数量的物理连接，适用于高吞吐场景，
+     *       避免与其他服务竞争网络资源。</li>
+     * </ul>
+     * </p>
+     *
+     * @param url 服务URL，包含连接数配置、共享连接数配置等网络参数
+     * @return ClientsProvider对象，提供用于RPC调用的ExchangeClient集合
+     */
     private ClientsProvider getClients(URL url) {
         int connections = url.getParameter(CONNECTIONS_KEY, 0);
         // whether to share connection
@@ -611,6 +645,9 @@ public class DubboProtocol extends AbstractProtocol {
         if (connections == 0) {
             /*
              * The xml configuration should have a higher priority than properties.
+             */
+            /*
+             * 共享连接模式：解析共享连接数配置，优先级为XML配置 > 系统属性/配置文件 > 默认值
              */
             String shareConnectionsStr = StringUtils.isBlank(url.getParameter(SHARE_CONNECTIONS_KEY, (String) null))
                     ? ConfigurationUtils.getProperty(
@@ -621,6 +658,9 @@ public class DubboProtocol extends AbstractProtocol {
             return getSharedClient(url, connections);
         }
 
+        /*
+         * 独占连接模式：为当前服务创建指定数量的独立物理连接
+         */
         List<ExchangeClient> clients =
                 IntStream.range(0, connections).mapToObj((i) -> initClient(url)).collect(Collectors.toList());
         return new ExclusiveClientsProvider(clients);

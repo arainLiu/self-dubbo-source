@@ -618,12 +618,28 @@ public class RegistryProtocol implements Protocol, ScopeModelAware {
     }
 
     /**
-     * Get an instance of registry based on the address of invoker
+     * 根据注册中心地址获取对应的注册中心实例，支持通过SPI机制动态选择注册中心实现。
+     * <p>
+     * 该方法通过ScopeModelUtil获取RegistryFactory的自适应扩展（Adaptive Extension），
+     * 根据URL中的协议类型（如zookeeper、nacos等）自动选择对应的注册中心工厂类，
+     * 并创建或返回已缓存的注册中心实例。
+     * </p>
+     * <p>
+     * 处理流程：
+     * <ol>
+     *   <li>从registryUrl中提取ScopeModel，获取RegistryFactory的扩展加载器</li>
+     *   <li>调用getAdaptiveExtension()获取自适应扩展实例，该实例会根据URL协议动态路由到具体的工厂实现</li>
+     *   <li>调用factory.getRegistry(registryUrl)创建或返回已缓存的注册中心实例</li>
+     * </ol>
+     * </p>
      *
-     * @param registryUrl
-     * @return
+     * @param registryUrl 注册中心的URL地址，包含协议类型、主机地址、端口号等信息
+     * @return 注册中心实例，用于执行服务的注册、订阅等操作
      */
     protected Registry getRegistry(final URL registryUrl) {
+        /*
+         * 获取RegistryFactory的自适应扩展，根据URL协议动态选择注册中心工厂实现
+         */
         RegistryFactory registryFactory = ScopeModelUtil.getExtensionLoader(
                         RegistryFactory.class, registryUrl.getScopeModel())
                 .getAdaptiveExtension();

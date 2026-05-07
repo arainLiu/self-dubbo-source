@@ -85,8 +85,19 @@ public class HeaderExchangeHandler implements ChannelHandlerDelegate {
         }
     }
 
+    /**
+     * 处理接收到的请求消息，构建响应并返回给调用方
+     * 支持对损坏请求的错误反馈，以及通过异步回调处理正常的业务逻辑调用
+     *
+     * @param channel 交换通道对象，用于发送响应消息
+     * @param req 请求对象，包含请求ID、版本信息及具体的业务数据
+     * @throws RemotingException 当远程通信过程中发生异常时抛出
+     */
     void handleRequest(final ExchangeChannel channel, Request req) throws RemotingException {
+        // 创建与请求对应的响应对象，关联请求ID和协议版本
         Response res = new Response(req.getId(), req.getVersion());
+
+        // 如果请求在解码阶段已标记为损坏，则构建错误响应并直接返回
         if (req.isBroken()) {
             Object data = req.getData();
 
@@ -104,21 +115,28 @@ public class HeaderExchangeHandler implements ChannelHandlerDelegate {
             channel.send(res);
             return;
         }
-        // find handler by message class.
+
+        // 获取请求中的业务数据，并交由下层处理器执行
         Object msg = req.getData();
         try {
+            // 触发业务逻辑处理，获取异步执行结果
             CompletionStage<Object> future = handler.reply(channel, msg);
+
+            // 注册异步回调，在业务逻辑执行完成后构建并发送响应
             future.whenComplete((appResult, t) -> {
                 try {
                     if (t == null) {
+                        // 业务执行成功，设置响应状态和结果值
                         res.setStatus(Response.OK);
                         res.setResult(appResult);
                     } else {
+                        // 业务执行抛出异常，设置服务错误状态和异常信息
                         res.setStatus(Response.SERVICE_ERROR);
                         res.setErrorMessage(StringUtils.toString(t));
                     }
                     channel.send(res);
                 } catch (RemotingException e) {
+                    // 记录响应发送失败的警告日志，避免影响主流程
                     logger.warn(
                             TRANSPORT_FAILED_RESPONSE,
                             "",
@@ -127,6 +145,7 @@ public class HeaderExchangeHandler implements ChannelHandlerDelegate {
                 }
             });
         } catch (Throwable e) {
+            // 捕获同步执行阶段的异常（如找不到处理器），立即返回服务错误响应
             res.setStatus(Response.SERVICE_ERROR);
             res.setErrorMessage(StringUtils.toString(e));
             channel.send(res);

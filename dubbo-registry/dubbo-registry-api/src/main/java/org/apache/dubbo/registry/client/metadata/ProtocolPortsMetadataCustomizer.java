@@ -43,6 +43,30 @@ public class ProtocolPortsMetadataCustomizer implements ServiceInstanceCustomize
     private static final ErrorTypeAwareLogger LOGGER =
             LoggerFactory.getErrorTypeAwareLogger(ProtocolPortsMetadataCustomizer.class);
 
+    /**
+     * 自定义服务实例的协议端口元数据，将暴露的服务URL按协议和端口进行归类并设置到实例中。
+     * <p>
+     * 该方法从服务实例的元数据信息中提取所有已导出的服务URL，统计每个协议监听的端口号，
+     * 并将结果以endpoints的形式存储到服务实例的元数据中。主要用于多协议场景下，
+     * 让消费者能够感知提供者支持的所有协议及其对应的端口。
+     * </p>
+     * <p>
+     * 处理流程：
+     * <ol>
+     *   <li>检查服务元数据和导出URL集合是否为空，如果为空则直接返回</li>
+     *   <li>遍历所有导出的URL集合，提取协议名和端口号，构建protocol->port映射关系</li>
+     *   <li>如果同一协议在不同端口上监听（旧端口与新端口不同），记录警告日志，后出现的端口会覆盖先前的端口</li>
+     *   <li>如果protocols映射不为空（存在至少一个协议），调用setEndpoints()将协议端口信息设置到服务实例中</li>
+     * </ol>
+     * </p>
+     * <p>
+     * 注意：当前实现对于同一协议监听多个端口的场景仅保留最后一个端口（见TODO注释），
+     * 这可能导致部分端口信息丢失。未来可能需要支持同一协议的多端口注册。
+     * </p>
+     *
+     * @param serviceInstance 要定制的服务实例对象，会被添加协议端口元数据
+     * @param applicationModel 应用模型，提供定制所需的上下文信息
+     */
     @Override
     public void customize(ServiceInstance serviceInstance, ApplicationModel applicationModel) {
         MetadataInfo metadataInfo = serviceInstance.getServiceMetadata();
@@ -69,6 +93,9 @@ public class ProtocolPortsMetadataCustomizer implements ServiceInstanceCustomize
             protocols.put(protocol, newPort);
         });
 
+        /*
+         * 仅在存在至少一个协议时设置endpoints元数据
+         */
         if (protocols.size() > 0) { // set endpoints only for multi-protocol scenario
             setEndpoints(serviceInstance, protocols);
         }

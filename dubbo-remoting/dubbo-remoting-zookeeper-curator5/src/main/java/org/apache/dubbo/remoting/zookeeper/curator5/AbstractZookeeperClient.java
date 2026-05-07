@@ -109,6 +109,26 @@ public abstract class AbstractZookeeperClient<TargetDataListener, TargetChildLis
         return stateListeners;
     }
 
+        /**
+     * 为指定的ZooKeeper节点路径添加子节点变更监听器，当子节点列表发生变化时触发回调。
+     * <p>
+     * 该方法采用两级缓存机制管理监听器：第一级以路径（path）为键缓存该路径下所有监听器的映射关系，
+     * 第二级以用户传入的ChildListener为键缓存对应的目标监听器（TargetChildListener）。
+     * 通过这种设计，确保同一监听器不会被重复注册，同时支持对同一路径注册多个不同的监听器。
+     * </p>
+     * <p>
+     * 处理流程：
+     * <ol>
+     *   <li>从childListeners缓存中获取或创建指定路径对应的监听器映射表（ConcurrentMap）</li>
+     *   <li>从映射表中获取或创建用户监听器对应的目标监听器，如果是首次注册则调用createTargetChildListener()创建底层实现</li>
+     *   <li>调用addTargetChildListener()将目标监听器注册到ZooKeeper客户端，并返回当前的子节点列表</li>
+     * </ol>
+     * </p>
+     *
+     * @param path ZooKeeper节点路径，如"/dubbo/com.example.Service/providers"
+     * @param listener 子节点变更监听器，当路径下的子节点增删时会收到通知
+     * @return 当前路径下的所有子节点名称列表，供监听器初始化时使用
+     */
     @Override
     public List<String> addChildListener(String path, final ChildListener listener) {
         ConcurrentMap<ChildListener, TargetChildListener> listeners =

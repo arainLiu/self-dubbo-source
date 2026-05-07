@@ -4,9 +4,9 @@ dubbo:
     qos-enable: false
     #默认local
     metadata-type: remote
-  #    register-mode: all
+    register-mode: all
 #    register-mode: instance
-    register-mode: interface
+#    register-mode: interface
   registry:
     address: zookeeper://127.0.0.1:2181
     scope: remote

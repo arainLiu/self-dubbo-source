@@ -61,25 +61,57 @@ public abstract class AbstractLoadBalance implements LoadBalance {
 
     protected abstract <T> Invoker<T> doSelect(List<Invoker<T>> invokers, URL url, Invocation invocation);
 
-    /**
-     * Get the weight of the invoker's invocation which takes warmup time into account
-     * if the uptime is within the warmup time, the weight will be reduce proportionally
+        /**
+     * 获取Invoker的动态权重，综合考虑配置权重、服务预热时间和多注册中心场景。
+     * <p>
+     * 该方法用于负载均衡算法中计算每个服务提供者的实际权重。如果服务处于预热阶段（uptime < warmup），
+     * 权重会按启动时间的比例线性增加，避免新启动的服务因尚未完全初始化而承受过高流量。
+     * </p>
+     * <p>
+     * 处理流程：
+     * <ol>
+     *   <li>确定使用的URL：如果是ClusterInvoker类型，则使用registryUrl以支持多注册中心负载均衡</li>
+     *   <li>判断是否为注册中心内部服务引用（REGISTRY_SERVICE_REFERENCE_PATH）：
+     *     <ul>
+     *       <li>如果是，直接使用URL上的全局weight参数</li>
+     *       <li>如果不是，使用方法级别的weight参数，支持针对不同方法进行差异化权重配置</li>
+     *     </ul>
+     *   </li>
+     *   <li>如果配置权重大于0，检查服务是否处于预热阶段：
+     *     <ul>
+     *       <li>从URL中提取服务启动时间戳（timestamp），计算已运行时长（uptime）</li>
+     *       <li>如果uptime为负数（时钟不同步），返回最小权重1以保证基本可用性</li>
+     *       <li>如果uptime在预热时间（warmup）范围内，调用calculateWarmupWeight()计算递减后的权重</li>
+     *     </ul>
+     *   </li>
+     *   <li>返回最终权重，确保不为负数（Math.max(weight, 0)）</li>
+     * </ol>
+     * </p>
      *
-     * @param invoker    the invoker
-     * @param invocation the invocation of this invoker
-     * @return weight
+     * @param invoker 要计算权重的Invoker对象，包含服务配置和元数据信息
+     * @param invocation 当前的RPC调用上下文，用于提取方法名以获取方法级配置
+     * @return 计算后的动态权重值，已考虑预热衰减因素
      */
     protected int getWeight(Invoker<?> invoker, Invocation invocation) {
         int weight;
         URL url = invoker.getUrl();
         if (invoker instanceof ClusterInvoker) {
+            /*
+             * 多注册中心场景：使用registryUrl进行负载均衡决策
+             */
             url = ((ClusterInvoker<?>) invoker).getRegistryUrl();
         }
 
         // Multiple registry scenario, load balance among multiple registries.
         if (REGISTRY_SERVICE_REFERENCE_PATH.equals(url.getServiceInterface())) {
+            /*
+             * 注册中心内部服务：使用全局权重配置
+             */
             weight = url.getParameter(WEIGHT_KEY, DEFAULT_WEIGHT);
         } else {
+            /*
+             * 普通业务服务：使用方法级别的权重配置
+             */
             weight = url.getMethodParameter(RpcUtils.getMethodName(invocation), WEIGHT_KEY, DEFAULT_WEIGHT);
             if (weight > 0) {
                 long timestamp = invoker.getUrl().getParameter(TIMESTAMP_KEY, 0L);
@@ -90,6 +122,9 @@ public abstract class AbstractLoadBalance implements LoadBalance {
                     }
                     int warmup = invoker.getUrl().getParameter(WARMUP_KEY, DEFAULT_WARMUP);
                     if (uptime > 0 && uptime < warmup) {
+                        /*
+                         * 预热阶段：按运行时间比例递减权重，避免新实例过载
+                         */
                         weight = calculateWarmupWeight((int) uptime, warmup, weight);
                     }
                 }

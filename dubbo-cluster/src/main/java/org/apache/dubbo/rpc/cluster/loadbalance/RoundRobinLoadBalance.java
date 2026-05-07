@@ -89,6 +89,27 @@ public class RoundRobinLoadBalance extends AbstractLoadBalance {
         return null;
     }
 
+    /**
+     * 基于加权平滑轮询算法（Weighted Round Robin）选择服务提供者。
+     * <p>
+     * 该算法通过为每个Invoker维护一个当前权重（current weight），在每次调用时动态调整并选出当前权重最大的节点，
+     * 从而实现流量的均匀分布并兼顾各节点的权重差异。主要执行以下操作：
+     * <ol>
+     *   <li>生成缓存键：由服务接口名和方法名组成，确保不同方法的负载均衡状态相互隔离</li>
+     *   <li>遍历所有Invoker，获取其动态权重（考虑预热因素），并为每个Invoker维护一个WeightedRoundRobin对象</li>
+     *   <li>如果检测到权重发生变化，实时更新WeightedRoundRobin中的配置权重</li>
+     *   <li>调用increaseCurrent()增加当前权重，并记录最后更新时间</li>
+     *   <li>找出当前权重最大的Invoker作为本次调用的目标节点</li>
+     *   <li>清理过期数据：如果缓存中的Invoker数量与实际列表不一致（如有节点下线），则移除超过RECYCLE_PERIOD未更新的记录</li>
+     *   <li>调用selectedWRR.sel(totalWeight)减少选中节点的当前权重，实现权重的周期性回落</li>
+     * </ol>
+     * </p>
+     *
+     * @param invokers 待选择的Invoker列表，包含所有可用的服务提供者
+     * @param url 消费者URL，包含负载均衡配置和服务元数据
+     * @param invocation RPC调用上下文，用于提取方法名以获取方法级权重配置
+     * @return 根据加权轮询算法选出的最优Invoker对象
+     */
     @Override
     protected <T> Invoker<T> doSelect(List<Invoker<T>> invokers, URL url, Invocation invocation) {
         String key = invokers.get(0).getUrl().getServiceKey() + "." + RpcUtils.getMethodName(invocation);
@@ -100,6 +121,9 @@ public class RoundRobinLoadBalance extends AbstractLoadBalance {
         Invoker<T> selectedInvoker = null;
         WeightedRoundRobin selectedWRR = null;
         for (Invoker<T> invoker : invokers) {
+            /*
+             * 获取或创建当前Invoker的加权轮询状态对象，并同步最新的权重配置
+             */
             String identifyString = invoker.getUrl().toIdentityString();
             int weight = getWeight(invoker, invocation);
             WeightedRoundRobin weightedRoundRobin = ConcurrentHashMapUtils.computeIfAbsent(map, identifyString, k -> {
@@ -112,6 +136,9 @@ public class RoundRobinLoadBalance extends AbstractLoadBalance {
                 // weight changed
                 weightedRoundRobin.setWeight(weight);
             }
+            /*
+             * 增加当前权重并更新最后活跃时间，参与最大权重竞争
+             */
             long cur = weightedRoundRobin.increaseCurrent();
             weightedRoundRobin.setLastUpdate(now);
             if (cur > maxCurrent) {
@@ -121,10 +148,16 @@ public class RoundRobinLoadBalance extends AbstractLoadBalance {
             }
             totalWeight += weight;
         }
+        /*
+         * 清理已下线的Invoker对应的权重状态，防止内存泄漏
+         */
         if (invokers.size() != map.size()) {
             map.entrySet().removeIf(item -> now - item.getValue().getLastUpdate() > RECYCLE_PERIOD);
         }
         if (selectedInvoker != null) {
+            /*
+             * 选中节点后，扣减其当前权重以实现轮转效果
+             */
             selectedWRR.sel(totalWeight);
             return selectedInvoker;
         }
