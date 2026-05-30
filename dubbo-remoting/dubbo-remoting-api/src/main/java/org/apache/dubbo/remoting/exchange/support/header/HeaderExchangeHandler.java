@@ -177,20 +177,37 @@ public class HeaderExchangeHandler implements ChannelHandlerDelegate {
         }
     }
 
+    /**
+     * 处理消息发送完成事件。
+     * 该方法在消息成功写入底层通道后被调用，主要执行以下逻辑：
+     * 1. 委托给下层 handler 处理业务逻辑
+     * 2. 如果发送的是 Request 请求，通知 DefaultFuture 记录发送时间，用于超时计算
+     * 3. 如果发送的是 MultiMessage，则遍历其中的每个 Request 并分别通知 DefaultFuture
+     * 4. 统一处理发送过程中捕获的异常，并根据异常类型进行转换抛出
+     *
+     * @param channel 发生事件的底层 Netty Channel
+     * @param message 已发送的消息对象
+     * @throws RemotingException 当发送过程中发生异常时抛出
+     */
     @Override
     public void sent(Channel channel, Object message) throws RemotingException {
         Throwable exception = null;
         try {
+            // 获取或创建关联的 ExchangeChannel
             ExchangeChannel exchangeChannel = HeaderExchangeChannel.getOrAddChannel(channel);
+            // 委托给下层 handler 处理发送事件
             handler.sent(exchangeChannel, message);
         } catch (Throwable t) {
             exception = t;
+            // 如果发送失败且通道可能已断开，则从缓存中移除该通道
             HeaderExchangeChannel.removeChannelIfDisconnected(channel);
         }
+        // 如果发送的是普通请求，通知 DefaultFuture 更新发送状态
         if (message instanceof Request) {
             Request request = (Request) message;
             DefaultFuture.sent(channel, request);
         }
+        // 如果发送的是批量消息，遍历并处理其中的每个请求
         if (message instanceof MultiMessage) {
             MultiMessage multiMessage = (MultiMessage) message;
             for (Object single : multiMessage) {
@@ -199,6 +216,7 @@ public class HeaderExchangeHandler implements ChannelHandlerDelegate {
                 }
             }
         }
+        // 如果在委托处理过程中发生了异常，在此处统一抛出
         if (exception != null) {
             if (exception instanceof RuntimeException) {
                 throw (RuntimeException) exception;

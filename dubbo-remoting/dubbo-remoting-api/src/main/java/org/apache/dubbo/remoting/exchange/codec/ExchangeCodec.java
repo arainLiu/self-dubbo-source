@@ -53,19 +53,31 @@ import static org.apache.dubbo.common.constants.LoggerCodeConstants.TRANSPORT_SK
 
 /**
  * ExchangeCodec.
+ * Dubbo 交换层编解码器，负责 Request 和 Response 对象的序列化与反序列化。
+ * 它定义了 Dubbo 协议的二进制帧结构：
+ * 1. 16字节的固定消息头（包含魔数、标志位、状态、请求ID、数据长度）
+ * 2. 可变长度的消息体（由具体的序列化协议决定）
+ *
+ * 该编解码器还支持心跳检测、事件标记以及 payload 大小限制检查。
  */
 public class ExchangeCodec extends TelnetCodec {
 
     // header length.
+    // 消息头的固定长度为 16 字节
     protected static final int HEADER_LENGTH = 16;
     // magic header.
+    // 魔数，用于快速识别 Dubbo 协议包
     protected static final short MAGIC = (short) 0xdabb;
     protected static final byte MAGIC_HIGH = Bytes.short2bytes(MAGIC)[0];
     protected static final byte MAGIC_LOW = Bytes.short2bytes(MAGIC)[1];
     // message flag.
+    // 消息标志位：请求包
     protected static final byte FLAG_REQUEST = (byte) 0x80;
+    // 消息标志位：双向通信（需要响应）
     protected static final byte FLAG_TWOWAY = (byte) 0x40;
+    // 消息标志位：事件包（如心跳）
     protected static final byte FLAG_EVENT = (byte) 0x20;
+    // 序列化 ID 的掩码，低 5 位用于存储序列化类型 ID
     protected static final int SERIALIZATION_MASK = 0x1f;
     private static final ErrorTypeAwareLogger logger = LoggerFactory.getErrorTypeAwareLogger(ExchangeCodec.class);
 
@@ -95,6 +107,7 @@ public class ExchangeCodec extends TelnetCodec {
     @Override
     protected Object decode(Channel channel, ChannelBuffer buffer, int readable, byte[] header) throws IOException {
         // check magic number.
+        // 检查魔数，如果不匹配则尝试寻找下一个魔数位置或回退到父类处理
         if (readable > 0 && header[0] != MAGIC_HIGH || readable > 1 && header[1] != MAGIC_LOW) {
             int length = header.length;
             if (header.length < readable) {
@@ -111,26 +124,31 @@ public class ExchangeCodec extends TelnetCodec {
             return super.decode(channel, buffer, readable, header);
         }
         // check length.
+        // 如果可读字节数小于消息头长度，说明数据不全，返回 NEED_MORE_INPUT
         if (readable < HEADER_LENGTH) {
             return DecodeResult.NEED_MORE_INPUT;
         }
 
         // get data length.
+        // 从消息头中获取消息体的长度
         int len = Bytes.bytes2int(header, 12);
 
         // When receiving response, how to exceed the length, then directly construct a response to the client.
         // see more detail from https://github.com/apache/dubbo/issues/7021.
+        // 检查响应数据是否超过 payload 限制，如果超过则直接构造错误响应
         Object obj = finishRespWhenOverPayload(channel, len, header);
         if (null != obj) {
             return obj;
         }
 
         int tt = len + HEADER_LENGTH;
+        // 如果当前缓冲区的数据不足以容纳整个消息，返回 NEED_MORE_INPUT
         if (readable < tt) {
             return DecodeResult.NEED_MORE_INPUT;
         }
 
         // limit input stream.
+        // 创建一个受限的输入流，确保只读取当前消息的长度
         ChannelBufferInputStream is = new ChannelBufferInputStream(buffer, len);
 
         try {
@@ -141,6 +159,7 @@ public class ExchangeCodec extends TelnetCodec {
                     if (logger.isWarnEnabled()) {
                         logger.warn(TRANSPORT_SKIP_UNUSED_STREAM, "", "", "Skip input stream " + is.available());
                     }
+                    // 跳过未使用的字节，防止影响后续消息的解码
                     StreamUtils.skipUnusedStream(is);
                 } catch (IOException e) {
                     logger.warn(TRANSPORT_SKIP_UNUSED_STREAM, "", "", e.getMessage(), e);
@@ -149,17 +168,30 @@ public class ExchangeCodec extends TelnetCodec {
         }
     }
 
+    /**
+     * 解码消息体内容。
+     * 根据消息头中的标志位判断是 Request 还是 Response，并调用相应的解码逻辑。
+     *
+     * @param channel 通信通道
+     * @param is 消息体输入流
+     * @param header 16字节的消息头
+     * @return 解码后的 Request 或 Response 对象
+     * @throws IOException 解码过程中发生的 IO 异常
+     */
     protected Object decodeBody(Channel channel, InputStream is, byte[] header) throws IOException {
         byte flag = header[2], proto = (byte) (flag & SERIALIZATION_MASK);
         // get request id.
+        // 从消息头中获取请求 ID
         long id = Bytes.bytes2long(header, 4);
         if ((flag & FLAG_REQUEST) == 0) {
             // decode response.
+            // 解码响应对象
             Response res = new Response(id);
             if ((flag & FLAG_EVENT) != 0) {
                 res.setEvent(true);
             }
             // get status.
+            // 获取响应状态码
             byte status = header[3];
             res.setStatus(status);
             try {
@@ -169,6 +201,7 @@ public class ExchangeCodec extends TelnetCodec {
                         byte[] eventPayload = CodecSupport.getPayload(is);
                         if (CodecSupport.isHeartBeat(eventPayload, proto)) {
                             // heart beat response data is always null;
+                            // 心跳响应的数据始终为空
                             data = null;
                         } else {
                             data = decodeEventData(
@@ -178,6 +211,7 @@ public class ExchangeCodec extends TelnetCodec {
                                     eventPayload);
                         }
                     } else {
+                        // 解码正常的响应数据，需要关联原始的请求数据以支持泛化调用等场景
                         data = decodeResponseData(
                                 channel,
                                 CodecSupport.deserialize(channel.getUrl(), is, proto),
@@ -185,6 +219,7 @@ public class ExchangeCodec extends TelnetCodec {
                     }
                     res.setResult(data);
                 } else {
+                    // 如果状态不为 OK，则读取错误信息字符串
                     res.setErrorMessage(CodecSupport.deserialize(channel.getUrl(), is, proto)
                             .readUTF());
                 }
@@ -195,6 +230,7 @@ public class ExchangeCodec extends TelnetCodec {
             return res;
         } else {
             // decode request.
+            // 解码请求对象
             Request req;
             try {
                 Object data;
@@ -202,6 +238,7 @@ public class ExchangeCodec extends TelnetCodec {
                     byte[] eventPayload = CodecSupport.getPayload(is);
                     if (CodecSupport.isHeartBeat(eventPayload, proto)) {
                         // heart beat response data is always null;
+                        // 创建心跳请求对象
                         req = new HeartBeatRequest(id);
                         ((HeartBeatRequest) req).setProto(proto);
                         data = null;
@@ -216,11 +253,13 @@ public class ExchangeCodec extends TelnetCodec {
                     req.setEvent(true);
                 } else {
                     req = new Request(id);
+                    // 解码请求参数数据
                     data = decodeRequestData(channel, CodecSupport.deserialize(channel.getUrl(), is, proto));
                 }
                 req.setData(data);
             } catch (Throwable t) {
                 // bad request
+                // 如果解码失败，创建一个损坏的请求对象并记录异常
                 req = new Request(id);
                 req.setBroken(true);
                 req.setData(t);
@@ -231,6 +270,16 @@ public class ExchangeCodec extends TelnetCodec {
         }
     }
 
+    /**
+     * 获取与响应 ID 匹配的原始请求数据。
+     * 主要用于在解码响应时恢复请求上下文（如方法名、参数类型等）。
+     *
+     * @param channel 通信通道
+     * @param response 当前正在解码的响应
+     * @param id 请求/响应 ID
+     * @return 原始请求的数据对象
+     * @throws IllegalArgumentException 如果找不到对应的请求
+     */
     protected Object getRequestData(Channel channel, Response response, long id) {
         DefaultFuture future = DefaultFuture.getFuture(id);
         if (future != null) {
@@ -254,14 +303,25 @@ public class ExchangeCodec extends TelnetCodec {
         throw new IllegalArgumentException("Failed to find any request match the response, response id: " + id);
     }
 
+    /**
+     * 编码请求对象。
+     * 构建 16 字节的消息头，并将请求数据序列化后写入缓冲区。
+     *
+     * @param channel 通信通道
+     * @param buffer 输出缓冲区
+     * @param req 要编码的请求对象
+     * @throws IOException 编码过程中发生的 IO 异常
+     */
     protected void encodeRequest(Channel channel, ChannelBuffer buffer, Request req) throws IOException {
         Serialization serialization = getSerialization(channel, req);
         // header.
         byte[] header = new byte[HEADER_LENGTH];
         // set magic number.
+        // 设置魔数
         Bytes.short2bytes(MAGIC, header);
 
         // set request and serialization flag.
+        // 设置请求标志位和序列化 ID
         header[2] = (byte) (FLAG_REQUEST | serialization.getContentTypeId());
 
         if (req.isTwoWay()) {
@@ -272,15 +332,18 @@ public class ExchangeCodec extends TelnetCodec {
         }
 
         // set request id.
+        // 设置请求 ID
         Bytes.long2bytes(req.getId(), header, 4);
 
         // encode request data.
+        // 先预留消息头的位置，直接跳到消息体位置进行序列化
         int savedWriteIndex = buffer.writerIndex();
         buffer.writerIndex(savedWriteIndex + HEADER_LENGTH);
         ChannelBufferOutputStream bos = new ChannelBufferOutputStream(buffer);
 
         if (req.isHeartbeat()) {
             // heartbeat request data is always null
+            // 心跳请求的数据部分为空
             bos.write(CodecSupport.getNullBytesOf(serialization));
         } else {
             ObjectOutput out = serialization.serialize(channel.getUrl(), bos);
@@ -298,15 +361,27 @@ public class ExchangeCodec extends TelnetCodec {
         bos.flush();
         bos.close();
         int len = bos.writtenBytes();
+        // 检查序列化后的数据大小是否超过 payload 限制
         checkPayload(channel, req.getPayload(), len);
+        // 将消息体长度写入消息头
         Bytes.int2bytes(len, header, 12);
 
         // write
+        // 回到预留位置写入消息头
         buffer.writerIndex(savedWriteIndex);
         buffer.writeBytes(header); // write header.
         buffer.writerIndex(savedWriteIndex + HEADER_LENGTH + len);
     }
 
+    /**
+     * 编码响应对象。
+     * 构建 16 字节的消息头，并将响应结果或错误信息序列化后写入缓冲区。
+     *
+     * @param channel 通信通道
+     * @param buffer 输出缓冲区
+     * @param res 要编码的响应对象
+     * @throws IOException 编码过程中发生的 IO 异常
+     */
     protected void encodeResponse(Channel channel, ChannelBuffer buffer, Response res) throws IOException {
         int savedWriteIndex = buffer.writerIndex();
         try {
@@ -314,16 +389,20 @@ public class ExchangeCodec extends TelnetCodec {
             // header.
             byte[] header = new byte[HEADER_LENGTH];
             // set magic number.
+            // 设置魔数
             Bytes.short2bytes(MAGIC, header);
             // set request and serialization flag.
+            // 设置序列化 ID（响应包不需要设置 REQUEST 标志位）
             header[2] = serialization.getContentTypeId();
             if (res.isHeartbeat()) {
                 header[2] |= FLAG_EVENT;
             }
             // set response status.
+            // 设置响应状态码
             byte status = res.getStatus();
             header[3] = status;
             // set request id.
+            // 设置请求 ID
             Bytes.long2bytes(res.getId(), header, 4);
 
             buffer.writerIndex(savedWriteIndex + HEADER_LENGTH);
@@ -334,6 +413,7 @@ public class ExchangeCodec extends TelnetCodec {
                 if (status == Response.OK) {
                     if (res.isHeartbeat()) {
                         // heartbeat response data is always null
+                        // 心跳响应的数据部分为空
                         bos.write(CodecSupport.getNullBytesOf(serialization));
                     } else {
                         ObjectOutput out = serialization.serialize(channel.getUrl(), bos);
@@ -348,6 +428,7 @@ public class ExchangeCodec extends TelnetCodec {
                         }
                     }
                 } else {
+                    // 如果状态异常，序列化错误信息字符串
                     ObjectOutput out = serialization.serialize(channel.getUrl(), bos);
                     out.writeUTF(res.getErrorMessage());
                     out.flushBuffer();
@@ -363,13 +444,16 @@ public class ExchangeCodec extends TelnetCodec {
             checkPayload(channel, len);
             Bytes.int2bytes(len, header, 12);
             // write
+            // 回到预留位置写入消息头
             buffer.writerIndex(savedWriteIndex);
             buffer.writeBytes(header); // write header.
             buffer.writerIndex(savedWriteIndex + HEADER_LENGTH + len);
         } catch (Throwable t) {
             // clear buffer
+            // 发生异常时重置写指针
             buffer.writerIndex(savedWriteIndex);
             // send error message to Consumer, otherwise, Consumer will wait till timeout.
+            // 尝试向消费者发送一个 BAD_RESPONSE，避免客户端超时等待
             if (!res.isEvent() && res.getStatus() != Response.BAD_RESPONSE) {
                 Response r = new Response(res.getId(), res.getVersion());
                 r.setStatus(Response.BAD_RESPONSE);
@@ -415,6 +499,7 @@ public class ExchangeCodec extends TelnetCodec {
             }
 
             // Rethrow exception
+            // 重新抛出异常，交由上层处理器捕获
             if (t instanceof IOException) {
                 throw (IOException) t;
             } else if (t instanceof RuntimeException) {
@@ -537,8 +622,18 @@ public class ExchangeCodec extends TelnetCodec {
         encodeResponseData(out, data);
     }
 
+    /**
+     * 当响应数据长度超过 payload 限制时，提前构造一个错误响应。
+     * 这种机制可以防止服务端反序列化过大的数据包导致内存溢出。
+     *
+     * @param channel 通信通道
+     * @param size 消息体长度
+     * @param header 消息头
+     * @return 如果超限则返回错误响应，否则返回 null
+     */
     private Object finishRespWhenOverPayload(Channel channel, long size, byte[] header) {
         byte flag = header[2];
+        // 只有响应包才在此处检查 payload 限制
         if ((flag & FLAG_REQUEST) == 0) {
             int payload = getPayload(channel);
             boolean overPayload = isOverPayload(payload, size);

@@ -24,6 +24,11 @@ import org.apache.dubbo.rpc.RpcException;
 
 /**
  * InvokerWrapper
+ * Invoker 的包装类实现，用于封装底层的 Invoker 实例并持有独立的 URL。
+ * 该类通常用于在 Invoker 生命周期管理（如销毁、状态检查）时提供一个稳定的代理层，
+ * 即使底层 Invoker 发生变化或被销毁，外层依然可以保持对原始 URL 和接口类型的引用。
+ *
+ * @param <T> 服务接口类型
  */
 public class InvokerWrapper<T> implements Invoker<T> {
 
@@ -31,6 +36,12 @@ public class InvokerWrapper<T> implements Invoker<T> {
 
     private final URL url;
 
+    /**
+     * 构造 InvokerWrapper 实例。
+     *
+     * @param invoker 被包装的底层 Invoker 实例
+     * @param url 该 Invoker 对应的服务 URL
+     */
     public InvokerWrapper(Invoker<T> invoker, URL url) {
         this.invoker = invoker;
         this.url = url;

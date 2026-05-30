@@ -44,34 +44,43 @@ import static org.apache.dubbo.registry.Constants.DEFAULT_REGISTRY_RETRY_PERIOD;
 import static org.apache.dubbo.registry.Constants.REGISTRY_RETRY_PERIOD_KEY;
 
 /**
- * A template implementation of registry service that provides auto-retry ability.
- * (SPI, Prototype, ThreadSafe)
+ * 具备失败重试能力的注册中心抽象基类
+ * 继承自AbstractRegistry，通过HashedWheelTimer定时任务机制处理注册、注销、订阅、反订阅过程中的临时性故障
+ * 确保在网络抖动或注册中心短暂不可用时，服务能够通过自动重试最终达成一致状态
+ *  * A template implementation of registry service that provides auto-retry ability.
+ *  * (SPI, Prototype, ThreadSafe)
  */
 public abstract class FailbackRegistry extends AbstractRegistry {
 
     /*  retry task map */
 
+    /** 存储注册失败的任务，以URL为键 */
     private final ConcurrentMap<URL, FailedRegisteredTask> failedRegistered = new ConcurrentHashMap<>();
 
+    /** 存储注销失败的任务，以URL为键 */
     private final ConcurrentMap<URL, FailedUnregisteredTask> failedUnregistered = new ConcurrentHashMap<>();
 
+    /** 存储订阅失败的任务，以Holder（URL+Listener）为键 */
     private final ConcurrentMap<Holder, FailedSubscribedTask> failedSubscribed = new ConcurrentHashMap<>();
 
+    /** 存储反订阅失败的任务，以Holder（URL+Listener）为键 */
     private final ConcurrentMap<Holder, FailedUnsubscribedTask> failedUnsubscribed = new ConcurrentHashMap<>();
 
     /**
-     * The time in milliseconds the retryExecutor will wait
+     * 重试执行器的等待周期，单位为毫秒
      */
     private final int retryPeriod;
 
-    // Timer for failure retry, regular check if there is a request for failure, and if there is, an unlimited retry
+    // 用于失败重试的定时器，定期检查是否有失败请求，如果有则执行无限次重试
     private final HashedWheelTimer retryTimer;
 
     public FailbackRegistry(URL url) {
         super(url);
+        // 从URL参数中获取重试周期，默认为DEFAULT_REGISTRY_RETRY_PERIOD
         this.retryPeriod = url.getParameter(REGISTRY_RETRY_PERIOD_KEY, DEFAULT_REGISTRY_RETRY_PERIOD);
 
         // since the retry task will not be very much. 128 ticks is enough.
+        // 初始化时间轮定时器，使用守护线程，128个槽位足以应对常规的重试任务量
         retryTimer = new HashedWheelTimer(
                 new NamedThreadFactory("DubboRegistryRetryTimer", true), retryPeriod, TimeUnit.MILLISECONDS, 128);
     }
@@ -94,6 +103,10 @@ public abstract class FailbackRegistry extends AbstractRegistry {
         failedUnsubscribed.remove(h);
     }
 
+    /**
+     * 将注册失败的URL加入重试队列
+     * 如果该URL已经在重试队列中，则不重复添加
+     */
     private void addFailedRegistered(URL url) {
         FailedRegisteredTask oldOne = failedRegistered.get(url);
         if (oldOne != null) {
@@ -103,10 +116,14 @@ public abstract class FailbackRegistry extends AbstractRegistry {
         oldOne = failedRegistered.putIfAbsent(url, newTask);
         if (oldOne == null) {
             // never has a retry task. then start a new task for retry.
+            // 首次添加失败任务时，启动定时器进行周期性重试
             retryTimer.newTimeout(newTask, retryPeriod, TimeUnit.MILLISECONDS);
         }
     }
 
+    /**
+     * 从重试队列中移除注册失败的任务，并取消对应的定时任务
+     */
     private void removeFailedRegistered(URL url) {
         FailedRegisteredTask f = failedRegistered.remove(url);
         if (f != null) {
@@ -114,6 +131,9 @@ public abstract class FailbackRegistry extends AbstractRegistry {
         }
     }
 
+    /**
+     * 将注销失败的URL加入重试队列
+     */
     private void addFailedUnregistered(URL url) {
         FailedUnregisteredTask oldOne = failedUnregistered.get(url);
         if (oldOne != null) {
@@ -127,6 +147,9 @@ public abstract class FailbackRegistry extends AbstractRegistry {
         }
     }
 
+    /**
+     * 从重试队列中移除注销失败的任务，并取消对应的定时任务
+     */
     private void removeFailedUnregistered(URL url) {
         FailedUnregisteredTask f = failedUnregistered.remove(url);
         if (f != null) {
@@ -134,6 +157,9 @@ public abstract class FailbackRegistry extends AbstractRegistry {
         }
     }
 
+    /**
+     * 将订阅失败的URL和监听器加入重试队列
+     */
     protected void addFailedSubscribed(URL url, NotifyListener listener) {
         Holder h = new Holder(url, listener);
         FailedSubscribedTask oldOne = failedSubscribed.get(h);
@@ -148,6 +174,9 @@ public abstract class FailbackRegistry extends AbstractRegistry {
         }
     }
 
+    /**
+     * 从重试队列中移除订阅失败的任务，同时也会移除相关的反订阅失败任务
+     */
     public void removeFailedSubscribed(URL url, NotifyListener listener) {
         Holder h = new Holder(url, listener);
         FailedSubscribedTask f = failedSubscribed.remove(h);
@@ -157,6 +186,9 @@ public abstract class FailbackRegistry extends AbstractRegistry {
         removeFailedUnsubscribed(url, listener);
     }
 
+    /**
+     * 将反订阅失败的URL和监听器加入重试队列
+     */
     private void addFailedUnsubscribed(URL url, NotifyListener listener) {
         Holder h = new Holder(url, listener);
         FailedUnsubscribedTask oldOne = failedUnsubscribed.get(h);
@@ -171,6 +203,9 @@ public abstract class FailbackRegistry extends AbstractRegistry {
         }
     }
 
+    /**
+     * 从重试队列中移除反订阅失败的任务，并取消对应的定时任务
+     */
     private void removeFailedUnsubscribed(URL url, NotifyListener listener) {
         Holder h = new Holder(url, listener);
         FailedUnsubscribedTask f = failedUnsubscribed.remove(h);
@@ -295,11 +330,19 @@ public abstract class FailbackRegistry extends AbstractRegistry {
         }
     }
 
+    /**
+     * 判断给定的提供者URL是否应该被注册
+     *
+     * @param providerURL 提供者URL
+     * @return 如果应该注册返回true，否则返回false
+     */
     protected boolean shouldRegister(URL providerURL) {
         // extra protocol url must not be registered for interface based service discovery
+        // 如果是额外协议的URL，在基于接口的服务发现模式下不进行注册
         if (providerURL.getParameter(IS_EXTRA, false)) {
             return false;
         }
+        // 检查注册中心是否接受该协议类型的服务
         if (!acceptable(providerURL)) {
             logger.info("URL " + providerURL + " will not be registered to Registry. Registry " + this.getUrl()
                     + " does not accept service of this protocol type.");
@@ -331,18 +374,26 @@ public abstract class FailbackRegistry extends AbstractRegistry {
         }
     }
 
+    /**
+     * 从注册中心注销服务提供者地址，具备自动重试能力
+     *
+     * @param url 需要注销的服务提供者URL
+     */
     @Override
     public void unregister(URL url) {
         super.unregister(url);
+        // 清理之前可能存在的失败注册或注销记录
         removeFailedRegistered(url);
         removeFailedUnregistered(url);
         try {
             // Sending a cancellation request to the server side
+            // 执行实际的注销操作
             doUnregister(url);
         } catch (Exception e) {
             Throwable t = e;
 
             // If the startup detection is opened, the Exception is thrown directly.
+            // 判断是否需要立即抛出异常
             boolean check = getUrl().getParameter(Constants.CHECK_KEY, true)
                     && url.getParameter(Constants.CHECK_KEY, true)
                     && (url.getPort() != 0);
@@ -356,6 +407,7 @@ public abstract class FailbackRegistry extends AbstractRegistry {
                                 + t.getMessage(),
                         t);
             } else {
+                // 记录错误日志，等待定时任务重试
                 logger.error(
                         INTERNAL_ERROR,
                         "unknown error in registry module",
@@ -365,6 +417,7 @@ public abstract class FailbackRegistry extends AbstractRegistry {
             }
 
             // Record a failed registration request to a failed list, retry regularly
+            // 将失败的注销任务加入重试队列
             addFailedUnregistered(url);
         }
     }
@@ -483,17 +536,26 @@ public abstract class FailbackRegistry extends AbstractRegistry {
         }
     }
 
+    /**
+     * 取消订阅服务提供者地址和配置规则，具备自动重试能力
+     *
+     * @param url 订阅URL
+     * @param listener 通知监听器
+     */
     @Override
     public void unsubscribe(URL url, NotifyListener listener) {
         super.unsubscribe(url, listener);
+        // 清理之前可能存在的失败订阅记录
         removeFailedSubscribed(url, listener);
         try {
             // Sending a canceling subscription request to the server side
+            // 执行实际的取消订阅操作
             doUnsubscribe(url, listener);
         } catch (Exception e) {
             Throwable t = e;
 
             // If the startup detection is opened, the Exception is thrown directly.
+            // 判断是否需要立即抛出异常
             boolean check =
                     getUrl().getParameter(Constants.CHECK_KEY, true) && url.getParameter(Constants.CHECK_KEY, true);
             boolean skipFailback = t instanceof SkipFailbackWrapperException;
@@ -506,6 +568,7 @@ public abstract class FailbackRegistry extends AbstractRegistry {
                                 + t.getMessage(),
                         t);
             } else {
+                // 记录错误日志，等待定时任务重试
                 logger.error(
                         REGISTRY_FAILED_NOTIFY_EVENT,
                         "",
@@ -515,6 +578,7 @@ public abstract class FailbackRegistry extends AbstractRegistry {
             }
 
             // Record a failed registration request to a failed list, retry regularly
+            // 将失败的取消订阅任务加入重试队列
             addFailedUnsubscribed(url, listener);
         }
     }
@@ -531,6 +595,7 @@ public abstract class FailbackRegistry extends AbstractRegistry {
             doNotify(url, listener, urls);
         } catch (Exception t) {
             // Record a failed registration request to a failed list
+            // 通知失败时记录日志，但不影响主流程
             logger.error(
                     REGISTRY_FAILED_NOTIFY_EVENT,
                     "",
@@ -544,9 +609,14 @@ public abstract class FailbackRegistry extends AbstractRegistry {
         super.notify(url, listener, urls);
     }
 
+    /**
+     * 恢复注册和订阅状态
+     * 通常在注册中心重连后调用，将所有已注册和已订阅的URL重新加入重试队列
+     */
     @Override
     protected void recover() throws Exception {
         // register
+        // 恢复所有已注册的URL
         Set<URL> recoverRegistered = new HashSet<>(getRegistered());
         if (!recoverRegistered.isEmpty()) {
             if (logger.isInfoEnabled()) {
@@ -554,12 +624,14 @@ public abstract class FailbackRegistry extends AbstractRegistry {
             }
             for (URL url : recoverRegistered) {
                 // remove fail registry or unRegistry task first.
+                // 先清理旧的失败任务，再添加新的重试任务
                 removeFailedRegistered(url);
                 removeFailedUnregistered(url);
                 addFailedRegistered(url);
             }
         }
         // subscribe
+        // 恢复所有已订阅的URL
         Map<URL, Set<NotifyListener>> recoverSubscribed = new HashMap<>(getSubscribed());
         if (!recoverSubscribed.isEmpty()) {
             if (logger.isInfoEnabled()) {
@@ -569,6 +641,7 @@ public abstract class FailbackRegistry extends AbstractRegistry {
                 URL url = entry.getKey();
                 for (NotifyListener listener : entry.getValue()) {
                     // First remove other tasks to ensure that addFailedSubscribed can succeed.
+                    // 先清理旧的失败订阅任务，确保新任务能成功添加
                     removeFailedSubscribed(url, listener);
                     addFailedSubscribed(url, listener);
                 }
@@ -576,22 +649,51 @@ public abstract class FailbackRegistry extends AbstractRegistry {
         }
     }
 
+    /**
+     * 销毁注册中心实例，停止重试定时器
+     */
     @Override
     public void destroy() {
         super.destroy();
+        // 停止时间轮定时器，释放相关资源
         retryTimer.stop();
     }
 
     // ==== Template method ====
 
+    /**
+     * 执行实际的注册操作，由子类实现
+     *
+     * @param url 需要注册的URL
+     */
     public abstract void doRegister(URL url);
 
+    /**
+     * 执行实际的注销操作，由子类实现
+     *
+     * @param url 需要注销的URL
+     */
     public abstract void doUnregister(URL url);
 
+    /**
+     * 执行实际的订阅操作，由子类实现
+     *
+     * @param url 订阅URL
+     * @param listener 通知监听器
+     */
     public abstract void doSubscribe(URL url, NotifyListener listener);
 
+    /**
+     * 执行实际的取消订阅操作，由子类实现
+     *
+     * @param url 订阅URL
+     * @param listener 通知监听器
+     */
     public abstract void doUnsubscribe(URL url, NotifyListener listener);
 
+    /**
+     * 持有URL和监听器的组合键，用于在Map中唯一标识订阅关系
+     */
     static class Holder {
 
         private final URL url;

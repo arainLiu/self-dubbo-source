@@ -760,7 +760,7 @@ public class MigrationInvoker<T> implements MigrationClusterInvoker<T> {
             if (invoker != null) {
                 invoker.destroy();
             }
-            /*
+            /*ScopeClusterInvoker{directory=RegistryDirectory(registry: 127.0.0.1:2181)-Directory(invokers: 1[192.168.0.102:20881], validInvokers: 1[192.168.0.102:20881], invokersToReconnect: 0[]), isExported=false, peerFlag=false, injvmFlag=true}
              * 创建新的接口级Invoker：
              * 通过RegistryProtocol重新订阅接口级别的提供者地址
              */

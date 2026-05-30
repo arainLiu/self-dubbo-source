@@ -40,27 +40,45 @@ import static org.apache.dubbo.common.constants.LoggerCodeConstants.CLUSTER_EXEC
 import static org.apache.dubbo.common.constants.LoggerCodeConstants.INTERNAL_ERROR;
 import static org.apache.dubbo.common.extension.ExtensionScope.APPLICATION;
 
+/**
+ * 过滤器链构建器接口，负责将多个过滤器（Filter）组装成调用链
+ * 通过责任链模式实现对RPC调用的拦截、增强和监控功能
+ */
 @SPI(value = "default", scope = APPLICATION)
 public interface FilterChainBuilder {
     /**
-     * build consumer/provider filter chain
+     * 构建消费者或服务提供者的过滤器调用链
+     *
+     * @param invoker 原始调用器对象
+     * @param key 用于筛选过滤器的配置键
+     * @param group 过滤器所属的分组（consumer或provider）
+     * @return 包装了过滤器链的Invoker对象
      */
     <T> Invoker<T> buildInvokerChain(final Invoker<T> invoker, String key, String group);
 
     /**
-     * build consumer cluster filter chain
+     * 构建消费者端的集群过滤器调用链
+     *
+     * @param invoker 原始集群调用器对象
+     * @param key 用于筛选过滤器的配置键
+     * @param group 过滤器所属的分组
+     * @return 包装了过滤器链的ClusterInvoker对象
      */
     <T> ClusterInvoker<T> buildClusterInvokerChain(final ClusterInvoker<T> invoker, String key, String group);
 
     /**
-     * Works on provider side
+     * 过滤器链中的单个节点实现，工作在服务端（Provider）
+     * 每个节点持有一个过滤器和下一个节点的引用，形成递归调用结构
      *
-     * @param <T>
-     * @param <TYPE>
+     * @param <T> 服务接口类型
+     * @param <TYPE> 调用器类型
+     * @param <FILTER> 过滤器类型
      */
     class FilterChainNode<T, TYPE extends Invoker<T>, FILTER extends BaseFilter> implements Invoker<T> {
         TYPE originalInvoker;
+        /** 链表中的下一个节点 */
         Invoker<T> nextNode;
+        /** 当前节点持有的过滤器实例 */
         FILTER filter;
 
         public FilterChainNode(TYPE originalInvoker, Invoker<T> nextNode, FILTER filter) {
@@ -88,14 +106,25 @@ public interface FilterChainBuilder {
             return originalInvoker.isAvailable();
         }
 
+        /**
+         * 执行当前节点的过滤器逻辑，并异步监听后续链路的执行结果
+         * 支持在调用前后触发监听器回调，并记录详细的性能监控信息
+         *
+         * @param invocation 调用上下文
+         * @return 异步执行结果
+         * @throws RpcException 当过滤器逻辑或远程调用发生异常时抛出
+         */
         @Override
         public Result invoke(Invocation invocation) throws RpcException {
             Result asyncResult;
             try {
+                // 进入详细性能监控埋点，记录当前过滤器的执行耗时
                 InvocationProfilerUtils.enterDetailProfiler(
                         invocation, () -> "Filter " + filter.getClass().getName() + " invoke.");
+                // 执行过滤器逻辑并传递给下一个节点
                 asyncResult = filter.invoke(nextNode, invocation);
             } catch (Exception e) {
+                // 发生同步异常时释放监控埋点并触发错误回调
                 InvocationProfilerUtils.releaseDetailProfiler(invocation);
                 if (filter instanceof ListenableFilter) {
                     ListenableFilter listenableFilter = ((ListenableFilter) filter);
@@ -115,6 +144,7 @@ public interface FilterChainBuilder {
             } finally {
 
             }
+            // 注册异步完成回调，在远程调用真正结束后执行后置逻辑
             return asyncResult.whenCompleteWithContext((r, t) -> {
                 InvocationProfilerUtils.releaseDetailProfiler(invocation);
                 if (filter instanceof ListenableFilter) {
@@ -123,8 +153,10 @@ public interface FilterChainBuilder {
                     try {
                         if (listener != null) {
                             if (t == null) {
+                                // 调用成功，触发 onResponse 回调
                                 listener.onResponse(r, originalInvoker, invocation);
                             } else {
+                                // 调用失败，触发 onError 回调
                                 listener.onError(t, originalInvoker, invocation);
                             }
                         }
@@ -154,10 +186,12 @@ public interface FilterChainBuilder {
     }
 
     /**
-     * Works on consumer side
+     * 专用于消费者端（Consumer）的集群过滤器链节点
+     * 继承自 FilterChainNode 并实现了 ClusterInvoker 接口，以支持集群相关的元数据获取
      *
-     * @param <T>
-     * @param <TYPE>
+     * @param <T> 服务接口类型
+     * @param <TYPE> 集群调用器类型
+     * @param <FILTER> 过滤器类型
      */
     class ClusterFilterChainNode<T, TYPE extends ClusterInvoker<T>, FILTER extends BaseFilter>
             extends FilterChainNode<T, TYPE, FILTER> implements ClusterInvoker<T> {
@@ -181,10 +215,20 @@ public interface FilterChainBuilder {
         }
     }
 
+    /**
+     * 回调注册调用器，用于在过滤器链末端统一处理所有过滤器的异步回调
+     * 采用逆向遍历的方式确保过滤器回调的执行顺序与调用顺序相反（类似栈的后进先出）
+     *
+     * @param <T> 服务接口类型
+     * @param <FILTER> 过滤器类型
+     */
     class CallbackRegistrationInvoker<T, FILTER extends BaseFilter> implements Invoker<T> {
         private static final ErrorTypeAwareLogger LOGGER =
                 LoggerFactory.getErrorTypeAwareLogger(CallbackRegistrationInvoker.class);
+
+        /** 经过所有过滤器包装后的最终调用器 */
         final Invoker<T> filterInvoker;
+        /** 参与回调的所有过滤器列表 */
         final List<FILTER> filters;
 
         public CallbackRegistrationInvoker(Invoker<T> filterInvoker, List<FILTER> filters) {
@@ -192,11 +236,19 @@ public interface FilterChainBuilder {
             this.filters = filters;
         }
 
+        /**
+         * 执行最终的远程调用，并为列表中所有过滤器注册异步完成监听
+         *
+         * @param invocation 调用上下文
+         * @return 异步执行结果
+         * @throws RpcException 当调用或回调处理发生异常时抛出
+         */
         @Override
         public Result invoke(Invocation invocation) throws RpcException {
             Result asyncResult = filterInvoker.invoke(invocation);
             asyncResult.whenCompleteWithContext((r, t) -> {
                 RuntimeException filterRuntimeException = null;
+                // 逆序遍历过滤器列表，执行后置回调逻辑
                 for (int i = filters.size() - 1; i >= 0; i--) {
                     FILTER filter = filters.get(i);
                     try {
@@ -224,6 +276,7 @@ public interface FilterChainBuilder {
                             }
                         }
                     } catch (RuntimeException runtimeException) {
+                        // 捕获回调过程中的异常并记录日志，防止单个过滤器故障影响整体流程
                         LOGGER.error(
                                 CLUSTER_EXECUTE_FILTER_EXCEPTION,
                                 "the custom filter is abnormal",
@@ -276,6 +329,13 @@ public interface FilterChainBuilder {
         }
     }
 
+    /**
+     * 专用于消费者端的集群回调注册调用器
+     * 继承自 CallbackRegistrationInvoker 并补充了集群相关的元数据访问能力
+     *
+     * @param <T> 服务接口类型
+     * @param <FILTER> 过滤器类型
+     */
     class ClusterCallbackRegistrationInvoker<T, FILTER extends BaseFilter>
             extends CallbackRegistrationInvoker<T, FILTER> implements ClusterInvoker<T> {
         private ClusterInvoker<T> originalInvoker;

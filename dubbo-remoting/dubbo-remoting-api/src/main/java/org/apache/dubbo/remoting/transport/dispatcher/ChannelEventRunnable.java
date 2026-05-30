@@ -24,6 +24,14 @@ import org.apache.dubbo.remoting.ChannelHandler;
 
 import static org.apache.dubbo.common.constants.LoggerCodeConstants.INTERNAL_ERROR;
 
+/**
+ * 通道事件可运行任务。
+ * 该类封装了 Dubbo 网络通信中的各种事件（连接、断开、接收消息、发送完成、捕获异常），
+ * 并将其作为 Runnable 任务提交到线程池中异步执行。
+ *
+ * 它是 Dubbo 派发策略（Dispatcher）的核心组件，负责将 IO 线程接收到的事件转交给业务线程池处理，
+ * 从而实现 IO 处理与业务逻辑的解耦。
+ */
 public class ChannelEventRunnable implements Runnable {
     private static final ErrorTypeAwareLogger logger =
             LoggerFactory.getErrorTypeAwareLogger(ChannelEventRunnable.class);
@@ -46,6 +54,15 @@ public class ChannelEventRunnable implements Runnable {
         this(channel, handler, state, null, t);
     }
 
+    /**
+     * 构造通道事件任务实例。
+     *
+     * @param channel 发生事件的通信通道
+     * @param handler 负责处理该事件的 ChannelHandler
+     * @param state 当前事件的状态类型
+     * @param message 事件关联的消息对象（仅在 RECEIVED 或 SENT 状态下有效）
+     * @param exception 事件关联的异常对象（仅在 CAUGHT 状态下有效）
+     */
     public ChannelEventRunnable(
             Channel channel, ChannelHandler handler, ChannelState state, Object message, Throwable exception) {
         this.channel = channel;
@@ -152,31 +169,37 @@ public class ChannelEventRunnable implements Runnable {
 
     /**
      * ChannelState
+     * 通道事件状态枚举，定义了所有支持的网络事件类型。
      */
     public enum ChannelState {
 
         /**
          * CONNECTED
+         * 表示通道已成功建立连接
          */
         CONNECTED,
 
         /**
          * DISCONNECTED
+         * 表示通道连接已断开
          */
         DISCONNECTED,
 
         /**
          * SENT
+         * 表示消息已成功发送到网络
          */
         SENT,
 
         /**
          * RECEIVED
+         * 表示已从网络接收到消息
          */
         RECEIVED,
 
         /**
          * CAUGHT
+         * 表示在处理通道事件时捕获到了异常
          */
         CAUGHT
     }

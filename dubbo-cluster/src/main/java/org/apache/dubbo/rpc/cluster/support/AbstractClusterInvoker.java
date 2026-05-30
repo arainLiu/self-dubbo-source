@@ -516,32 +516,56 @@ public abstract class AbstractClusterInvoker<T> implements ClusterInvoker<T> {
     }
 
     /**
-     * Set the remoteAddress and remoteApplicationName so that filter can get them.
+     * 设置远程服务提供者的地址和应用名称到调用上下文和 Invocation 中。
+     * 这些信息会被传递给过滤器链，以便过滤器能够获取当前调用的目标提供者信息。
      *
+     * 该方法在集群调用执行前被调用，确保：
+     * 1. Invocation 记录了被调用的 Invoker，用于后续的路由和负载均衡决策
+     * 2. RpcServiceContext 中设置了远程地址，供监控、日志等过滤器使用
+     * 3. RpcServiceContext 中设置了远程应用名称，用于服务治理和追踪
+     *
+     * @param invoker 被选中的远程服务提供者实例
+     * @param invocation 当前的 RPC 调用信息
      */
     private void setRemote(Invoker<?> invoker, Invocation invocation) {
+        // 将当前 Invoker 添加到 Invocation 的已调用列表中，用于记录调用轨迹
         invocation.addInvokedInvoker(invoker);
+        // 获取当前的 RPC 服务上下文
         RpcServiceContext serviceContext = RpcContext.getServiceContext();
+        // 设置远程服务提供者的网络地址
         serviceContext.setRemoteAddress(invoker.getUrl().toInetSocketAddress());
+        // 设置远程服务提供者的应用名称
         serviceContext.setRemoteApplicationName(invoker.getUrl().getRemoteApplication());
     }
 
     /**
-     * When using a thread pool to fork a child thread, ThreadLocal cannot be passed.
-     * In this scenario, please use the invokeWithContextAsync method.
+     * 在异步或线程池分叉场景下执行远程调用。
+     * 当使用线程池派生子线程时，ThreadLocal 上下文无法自动传递，
+     * 因此需要通过该方法手动设置和清理 RPC 上下文。
      *
-     * @return
+     * 该方法确保：
+     * 1. 在调用前正确设置 RpcContext 上下文信息
+     * 2. 无论调用成功或失败，都在 finally 块中清理上下文，防止内存泄漏和上下文污染
+     *
+     * @param invoker 被选中的远程服务提供者实例
+     * @param invocation 当前的 RPC 调用信息
+     * @param consumerUrl 消费者 URL，用于构建上下文信息
+     * @return 远程调用的结果
      */
     protected Result invokeWithContextAsync(Invoker<T> invoker, Invocation invocation, URL consumerUrl) {
+        // 设置 RPC 上下文并保存原始的 Invoker 以便后续恢复
         Invoker<T> originInvoker = setContext(invoker, consumerUrl);
         Result result;
         try {
+            // 执行实际的远程调用
             result = invoker.invoke(invocation);
         } finally {
+            // 清理 RPC 上下文，恢复到调用前的状态
             clearContext(originInvoker);
         }
         return result;
     }
+
 
     protected abstract Result doInvoke(Invocation invocation, List<Invoker<T>> invokers, LoadBalance loadbalance)
             throws RpcException;
@@ -556,13 +580,22 @@ public abstract class AbstractClusterInvoker<T> implements ClusterInvoker<T> {
      * if invokers is not empty, init from the first invoke's url and invocation
      * if invokes is empty, init a default LoadBalance(RandomLoadBalance)
      * </p>
+     * 初始化并获取负载均衡策略实例。
+     * 该方法根据调用信息从服务提供者 URL 中提取针对特定方法的负载均衡配置。
+     * 如果未配置或调用者列表为空，则使用默认的负载均衡策略。
      *
-     * @param invokers   invokers
-     * @param invocation invocation
-     * @return LoadBalance instance. if not need init, return null.
+     * 查找优先级的逻辑：
+     * 1. 优先使用第一个 Invoker 的 URL 中配置的方法级负载均衡参数
+     * 2. 如果不存在方法级配置，回退到 DEFAULT_LOADBALANCE（通常为 random）
+     *
+     * @param invokers 可用的服务提供者列表，用于提取 URL 配置信息
+     * @param invocation RPC 调用信息，用于获取方法名以匹配特定的负载均衡规则
+     * @return 选定的负载均衡策略实例
      */
     protected LoadBalance initLoadBalance(List<Invoker<T>> invokers, Invocation invocation) {
+        // 获取应用模型以便加载扩展点
         ApplicationModel applicationModel = ScopeModelUtil.getApplicationModel(invocation.getModuleModel());
+        // 如果调用者列表不为空，尝试从第一个 Invoker 的 URL 中提取方法级的负载均衡配置
         if (CollectionUtils.isNotEmpty(invokers)) {
             return applicationModel
                     .getExtensionLoader(LoadBalance.class)
@@ -571,6 +604,7 @@ public abstract class AbstractClusterInvoker<T> implements ClusterInvoker<T> {
                             .getMethodParameter(
                                     RpcUtils.getMethodName(invocation), LOADBALANCE_KEY, DEFAULT_LOADBALANCE));
         } else {
+            // 如果列表为空，直接返回默认的负载均衡策略
             return applicationModel.getExtensionLoader(LoadBalance.class).getExtension(DEFAULT_LOADBALANCE);
         }
     }
@@ -579,9 +613,24 @@ public abstract class AbstractClusterInvoker<T> implements ClusterInvoker<T> {
         return setContext(invoker, null);
     }
 
+    /**
+     * 设置当前调用的 RPC 上下文信息。
+     * 该方法在调用远程服务前执行，将选中的 Invoker 和消费者 URL 设置到 RpcServiceContext 中，
+     * 以便后续的过滤器和拦截器能够获取当前的调用目标信息。
+     *
+     * 同时，该方法会保存并返回原始的 Invoker，用于在调用结束后恢复上下文状态，
+     * 确保多线程环境下的上下文隔离和正确性。
+     *
+     * @param invoker 当前选中的远程服务提供者实例
+     * @param consumerUrl 消费者 URL，如果为空则使用上下文中的默认值
+     * @return 调用前的原始 Invoker 实例，用于后续恢复上下文
+     */
     private Invoker<T> setContext(Invoker<T> invoker, URL consumerUrl) {
+        // 获取当前的 RPC 服务上下文
         RpcServiceContext context = RpcContext.getServiceContext();
+        // 保存原始的 Invoker，以便调用结束后恢复
         Invoker<?> originInvoker = context.getInvoker();
+        // 设置当前的 Invoker 和消费者 URL 到上下文中
         context.setInvoker(invoker)
                 .setConsumerUrl(
                         null != consumerUrl

@@ -88,13 +88,20 @@ import static org.apache.dubbo.common.constants.RegistryConstants.SERVICE_REGIST
 import static org.apache.dubbo.registry.Constants.CONFIGURATORS_SUFFIX;
 import static org.apache.dubbo.rpc.model.ScopeModelUtil.getModuleModel;
 
+/**
+ * 基于服务发现（应用级注册）的注册中心目录实现
+ * 继承自DynamicDirectory，负责从注册中心接收应用实例地址，并将其转换为可执行的Invoker对象
+ * 支持动态配置监听、地址变更通知以及多协议服务的匹配与路由
+ *
+ * @param <T> 服务接口类型
+ */
 public class ServiceDiscoveryRegistryDirectory<T> extends DynamicDirectory<T> {
     private static final ErrorTypeAwareLogger logger =
             LoggerFactory.getErrorTypeAwareLogger(ServiceDiscoveryRegistryDirectory.class);
 
     /**
-     * instance address to invoker mapping.
-     * The initial value is null and the midway may be assigned to null, please use the local variable reference
+     * 实例地址到Invoker的映射表
+     * 初始值为null，中途可能被赋值为null，请使用局部变量引用以避免并发问题
      */
     private volatile Map<ProtocolServiceKeyWithAddress, Invoker<T>> urlInvokerMap;
 
@@ -224,6 +231,11 @@ public class ServiceDiscoveryRegistryDirectory<T> extends DynamicDirectory<T> {
                 RouterChain.buildChain(getInterface(), url.addParameter(REGISTRY_TYPE_KEY, SERVICE_REGISTRY_TYPE)));
     }
 
+    /**
+     * 处理注册中心推送的地址变更通知，触发服务目录的刷新
+     *
+     * @param instanceUrls 注册中心推送的实例地址列表
+     */
     @Override
     public synchronized void notify(List<URL> instanceUrls) {
         if (isDestroyed()) {
@@ -233,6 +245,7 @@ public class ServiceDiscoveryRegistryDirectory<T> extends DynamicDirectory<T> {
         RpcServiceContext.getServiceContext().setConsumerUrl(getConsumerUrl());
 
         //  3.x added for extend URL address
+        // 执行地址监听器的扩展逻辑，允许第三方对地址列表进行预处理
         ExtensionLoader<AddressListener> addressListenerExtensionLoader =
                 getUrl().getOrDefaultModuleModel().getExtensionLoader(AddressListener.class);
         List<AddressListener> supportedListeners =
@@ -250,16 +263,19 @@ public class ServiceDiscoveryRegistryDirectory<T> extends DynamicDirectory<T> {
     @Override
     protected synchronized void refreshOverrideAndInvoker(List<URL> instanceUrls) {
         // mock zookeeper://xxx?mock=return null
+        // 使用配置规则覆盖目录URL，然后刷新Invoker列表
         this.directoryUrl = overrideDirectoryWithConfigurator(getOriginalConsumerUrl());
         refreshInvoker(instanceUrls);
     }
 
     protected URL overrideDirectoryWithConfigurator(URL url) {
         // override url with configurator from "app-name.configurators"
+        // 首先应用应用级别的配置覆盖
         url = overrideWithConfigurators(
                 getConsumerConfigurationListener(moduleModel).getConfigurators(), url);
 
         // override url with configurator from configurators from "service-name.configurators"
+        // 其次应用服务级别的配置覆盖
         if (referenceConfigurationListener != null) {
             url = overrideWithConfigurators(referenceConfigurationListener.getConfigurators(), url);
         }
@@ -300,10 +316,12 @@ public class ServiceDiscoveryRegistryDirectory<T> extends DynamicDirectory<T> {
 
     protected InstanceAddressURL overrideWithConfigurator(InstanceAddressURL providerUrl) {
         // override url with configurator from "app-name.configurators"
+        // 应用应用级别的配置覆盖到提供者地址
         providerUrl = overrideWithConfigurators(
                 getConsumerConfigurationListener(moduleModel).getConfigurators(), providerUrl);
 
         // override url with configurator from configurators from "service-name.configurators"
+        // 应用服务级别的配置覆盖到提供者地址
         if (referenceConfigurationListener != null) {
             providerUrl = overrideWithConfigurators(referenceConfigurationListener.getConfigurators(), providerUrl);
         }
@@ -347,11 +365,17 @@ public class ServiceDiscoveryRegistryDirectory<T> extends DynamicDirectory<T> {
                         == serviceListener.getServiceNames().size();
     }
 
+    /**
+     * 刷新Invoker列表，将注册中心推送的地址URL转换为可执行的Invoker对象
+     *
+     * @param invokerUrls 注册中心推送的地址列表，如果为空则表示清空所有地址
+     */
     private void refreshInvoker(List<URL> invokerUrls) {
         Assert.notNull(invokerUrls, "invokerUrls should not be null, use EMPTY url to clear current addresses.");
         this.originalUrls = invokerUrls;
 
         if (invokerUrls.size() == 1 && EMPTY_PROTOCOL.equals(invokerUrls.get(0).getProtocol())) {
+            // 收到空协议地址，表示禁用该服务，销毁所有Invoker并标记为禁止访问
             logger.warn(
                     PROTOCOL_UNSUPPORTED,
                     "",
@@ -366,6 +390,7 @@ public class ServiceDiscoveryRegistryDirectory<T> extends DynamicDirectory<T> {
         } else {
             this.forbidden = false; // Allow accessing
             if (CollectionUtils.isEmpty(invokerUrls)) {
+                // 收到空地址列表，出于保护目的忽略此次更新
                 logger.warn(
                         PROTOCOL_UNSUPPORTED,
                         "",
@@ -376,6 +401,7 @@ public class ServiceDiscoveryRegistryDirectory<T> extends DynamicDirectory<T> {
             }
 
             int originSize = invokerUrls.size();
+            // 对地址列表进行去重处理
             invokerUrls = invokerUrls.stream().distinct().collect(Collectors.toList());
             if (invokerUrls.size() != originSize) {
                 logger.info("Received duplicated invoker urls changed event from registry. "
@@ -388,8 +414,10 @@ public class ServiceDiscoveryRegistryDirectory<T> extends DynamicDirectory<T> {
 
             // use local reference to avoid NPE as this.urlInvokerMap will be set null concurrently at
             // destroyAllInvokers().
+            // 使用局部变量引用避免并发修改导致的NPE
             Map<ProtocolServiceKeyWithAddress, Invoker<T>> localUrlInvokerMap = this.urlInvokerMap;
             // can't use local reference as oldUrlInvokerMap's mappings might be removed directly at toInvokers().
+            // 构建旧Invoker映射表的副本，用于后续对比哪些Invoker已不再使用
             Map<ProtocolServiceKeyWithAddress, Invoker<T>> oldUrlInvokerMap = null;
             if (localUrlInvokerMap != null) {
                 // the initial capacity should be set greater than the maximum number of entries divided by the load
@@ -398,6 +426,8 @@ public class ServiceDiscoveryRegistryDirectory<T> extends DynamicDirectory<T> {
                         new LinkedHashMap<>(Math.round(1 + localUrlInvokerMap.size() / DEFAULT_HASHMAP_LOAD_FACTOR));
                 localUrlInvokerMap.forEach(oldUrlInvokerMap::put);
             }
+
+            // 将URL列表转换为新的Invoker映射表
             Map<ProtocolServiceKeyWithAddress, Invoker<T>> newUrlInvokerMap =
                     toInvokers(oldUrlInvokerMap, invokerUrls); // Translate url list to Invoker map
             logger.info(String.format("Refreshed invoker size %s from registry %s", newUrlInvokerMap.size(), this));
@@ -412,15 +442,20 @@ public class ServiceDiscoveryRegistryDirectory<T> extends DynamicDirectory<T> {
                                 "Cannot create invokers from url address list (total %s)", invokerUrls.size())));
                 return;
             }
+
+            // 构建不可修改的Invoker列表
             List<Invoker<T>> newInvokers = Collections.unmodifiableList(new ArrayList<>(newUrlInvokerMap.values()));
+            // 如果是多分组场景，则需要合并Invoker；否则直接使用新列表
             BitList<Invoker<T>> finalInvokers =
                     multiGroup ? new BitList<>(toMergeInvokerList(newInvokers)) : new BitList<>(newInvokers);
             // pre-route and build cache
+            // 刷新路由链并更新缓存中的Invoker列表
             refreshRouter(finalInvokers.clone(), () -> this.setInvokers(finalInvokers));
             this.urlInvokerMap = newUrlInvokerMap;
 
             if (oldUrlInvokerMap != null) {
                 try {
+                    // 销毁那些在旧列表中存在但在新列表中已不存在的Invoker
                     destroyUnusedInvokers(oldUrlInvokerMap, newUrlInvokerMap); // Close the unused Invoker
                 } catch (Exception e) {
                     logger.warn(PROTOCOL_FAILED_DESTROY_INVOKER, "", "", "destroyUnusedInvokers error. ", e);
@@ -429,6 +464,7 @@ public class ServiceDiscoveryRegistryDirectory<T> extends DynamicDirectory<T> {
         }
 
         // notify invokers refreshed
+        // 通知监听器Invoker列表已刷新
         this.invokersChanged();
 
         logger.info("Received invokers changed event from registry. " + "Registry type: instance. "
@@ -441,6 +477,12 @@ public class ServiceDiscoveryRegistryDirectory<T> extends DynamicDirectory<T> {
     }
 
     /**
+     * 将URL地址列表转换为Invoker映射表
+     * 如果URL已经在缓存中且未发生变更，则复用原有的Invoker，避免重复引用
+     *
+     * @param oldUrlInvokerMap 旧的Invoker映射表，在方法执行过程中可能会被修改（移除复用的项）
+     * @param urls 需要转换的URL地址列表
+     *
      * Turn urls into invokers, and if url has been refer, will not re-reference.
      * the items that will be put into newUrlInvokeMap will be removed from oldUrlInvokerMap.
      *
@@ -466,7 +508,7 @@ public class ServiceDiscoveryRegistryDirectory<T> extends DynamicDirectory<T> {
                     .hasExtension(instanceAddressURL.getProtocol())) {
 
                 // 4-1 - Unsupported protocol
-
+                // 如果协议类型不支持，记录错误日志并跳过该地址
                 logger.error(
                         PROTOCOL_UNSUPPORTED,
                         "protocol extension does not installed",
@@ -486,20 +528,24 @@ public class ServiceDiscoveryRegistryDirectory<T> extends DynamicDirectory<T> {
             instanceAddressURL.setProviderFirstParams(providerFirstParams);
 
             // Override provider urls if needed
+            // 如果启用了配置监听，则应用配置规则覆盖提供者地址
             if (enableConfigurationListen) {
                 instanceAddressURL = overrideWithConfigurator(instanceAddressURL);
             }
 
             // filter all the service available (version wildcard, group wildcard, protocol wildcard)
+            // 获取匹配的协议服务键，优先查找首选协议
             List<ProtocolServiceKey> matchedProtocolServiceKeys =
                     getMatchedProtocolServiceKeys(instanceAddressURL, true);
             if (CollectionUtils.isEmpty(matchedProtocolServiceKeys)) {
                 // if preferred protocol is not specified, use the default main protocol
+                // 如果没有找到首选协议，则回退到默认主协议
                 matchedProtocolServiceKeys = getMatchedProtocolServiceKeys(instanceAddressURL, false);
             }
 
             // see org.apache.dubbo.common.ProtocolServiceKey.isSameWith
             // check if needed to override the consumer url
+            // 判断是否需要包装Consumer URL（当匹配到多个协议或协议不一致时）
             boolean shouldWrap = matchedProtocolServiceKeys.size() != 1
                     || !consumerProtocolServiceKey.isSameWith(matchedProtocolServiceKeys.get(0));
 
@@ -522,6 +568,7 @@ public class ServiceDiscoveryRegistryDirectory<T> extends DynamicDirectory<T> {
                         }
                         if (enabled) {
                             if (shouldWrap) {
+                                // 如果需要包装，则构造新的Consumer URL并使用InstanceWrappedInvoker
                                 URL newConsumerUrl = ConcurrentHashMapUtils.computeIfAbsent(
                                         customizedConsumerUrlMap, matchedProtocolServiceKey, k -> consumerUrl
                                                 .setProtocol(k.getProtocol())
@@ -533,6 +580,7 @@ public class ServiceDiscoveryRegistryDirectory<T> extends DynamicDirectory<T> {
                                         newConsumerUrl,
                                         matchedProtocolServiceKey);
                             } else {
+                                // 直接引用服务
                                 invoker = protocol.refer(serviceType, instanceAddressURL);
                             }
                         }
@@ -549,6 +597,7 @@ public class ServiceDiscoveryRegistryDirectory<T> extends DynamicDirectory<T> {
                         newUrlInvokerMap.put(protocolServiceKeyWithAddress, invoker);
                     }
                 } else {
+                    // 复用缓存中的Invoker，并从旧映射表中移除以避免被销毁
                     newUrlInvokerMap.put(protocolServiceKeyWithAddress, invoker);
                     oldUrlInvokerMap.remove(protocolServiceKeyWithAddress, invoker);
                 }

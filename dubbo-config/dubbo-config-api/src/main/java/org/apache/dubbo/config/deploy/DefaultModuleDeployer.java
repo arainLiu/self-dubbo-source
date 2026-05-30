@@ -228,7 +228,7 @@ public class DefaultModuleDeployer extends AbstractDeployer<ModuleModel> impleme
              * 遍历模块内所有ServiceConfig，将Java对象暴露为RPC服务（绑定端口、生成Invoker等）
              */
             // export services
-            exportServices();
+                exportServices();
 
             /*
              * 准备应用级内部模块：
@@ -259,7 +259,7 @@ public class DefaultModuleDeployer extends AbstractDeployer<ModuleModel> impleme
 
                 /*
                  * 注册服务到注册中心：
-                 * 将所有导出的服务地址写入注册中心（Zookeeper/Nacos等），供消费者发现
+                     * `将所有导出的服务地址写入注册中心`（Zookeeper/Nacos等），供消费者发现
                  */
                 // register services to registry
                 registerServices();

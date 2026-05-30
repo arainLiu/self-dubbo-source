@@ -18,11 +18,15 @@ package org.apache.dubbo.springboot.demo;
 
 import java.util.concurrent.CompletableFuture;
 
+import org.apache.dubbo.springboot.demo.model.HelloDTO;
+
 public interface DemoService {
 
-    String sayHello(String name);
+    String sayHello(HelloDTO helloDTO);
 
     default CompletableFuture<String> sayHelloAsync(String name) {
-        return CompletableFuture.completedFuture(sayHello(name));
+        HelloDTO helloDTO = new HelloDTO();
+        helloDTO.setName(name);
+        return CompletableFuture.completedFuture(sayHello(helloDTO));
     }
 }

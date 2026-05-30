@@ -44,9 +44,24 @@ import static org.apache.dubbo.rpc.cluster.Constants.ROUTER_KEY;
 public class RouterChain<T> {
     private static final ErrorTypeAwareLogger logger = LoggerFactory.getErrorTypeAwareLogger(RouterChain.class);
 
+    /**
+     * 主路由链，承载当前正在生效的路由规则集合
+     * 在路由规则更新时，新规则会首先构建在此链上，经过验证后切换为当前链
+     */
     private volatile SingleRouterChain<T> mainChain;
+
+    /**
+     * 备用路由链，用于在异步构建新路由链时暂存旧规则或作为过渡状态
+     * 确保在路由规则刷新过程中，服务调用依然可以使用稳定的路由逻辑而不被中断
+     */
     private volatile SingleRouterChain<T> backupChain;
+
+    /**
+     * 当前实际执行的路由链引用
+     * 该字段指向 mainChain 或 backupChain 中的一个，通过原子切换实现路由规则的无锁更新和无缝衔接
+     */
     private volatile SingleRouterChain<T> currentChain;
+
 
     /**
      * 构建路由链对象，包含多个独立的路由链实例以支持并发场景下的无锁读取。
@@ -146,21 +161,39 @@ public class RouterChain<T> {
         return lock;
     }
 
+        /**
+     * 根据当前调用上下文获取应使用的单次路由链实例
+     * 该方法通过对比通知中的Invoker列表与当前可用的Invoker列表，智能选择主路由链或备用路由链，
+     * 确保在路由规则动态更新期间调用的连续性和数据的一致性
+     *
+     * @param url 消费者URL，包含路由配置信息
+     * @param availableInvokers 当前可用的Invoker列表，用于判断是否处于通知刷新阶段
+     * @param invocation 调用上下文，包含方法名、参数等路由决策所需信息
+     * @return 选定的SingleRouterChain实例，用于执行具体的路由过滤逻辑
+     */
     public SingleRouterChain<T> getSingleChain(URL url, BitList<Invoker<T>> availableInvokers, Invocation invocation) {
         // If current is in:
-        // 1. `setInvokers` is in progress
+        // 1. [setInvokers](file:///Users/liupengyu/openCode/dubbo/self-dubbo-source/dubbo-rpc/dubbo-rpc-api/src/main/java/org/apache/dubbo/rpc/RpcContext.java#L721-L723) is in progress
         // 2. Most of the invocation should use backup chain => currentChain == backupChain
         // 3. Main chain has been update success => notifyingInvokers.get() != null
         //     If `availableInvokers` is created from origin invokers => use backup chain
         //     If `availableInvokers` is created from newly invokers  => use main chain
+
+        // 获取正在通知刷新的Invoker列表引用，用于判断当前是否处于路由链切换的中间状态
         BitList<Invoker<T>> notifying = notifyingInvokers.get();
+
+        // 如果存在正在通知的列表，且当前执行链已切换至备用链，同时可用列表与通知列表同源，
+        // 则说明本次调用基于新产生的Invoker数据，应直接使用已更新完成的主路由链
         if (notifying != null
                 && currentChain == backupChain
                 && availableInvokers.getOriginList() == notifying.getOriginList()) {
             return mainChain;
         }
+
+        // 默认情况下返回当前生效的路由链（通常是备用链，直到切换完全结束）
         return currentChain;
     }
+
 
     /**
      * @deprecated use {@link RouterChain#getSingleChain(URL, BitList, Invocation)} and {@link SingleRouterChain#route(URL, BitList, Invocation)} instead
@@ -171,31 +204,39 @@ public class RouterChain<T> {
     }
 
     /**
-     * Notify router chain of the initial addresses from registry at the first time.
-     * Notify whenever addresses in registry change.
+     * 通知路由链接收来自注册中心的初始地址或变更后的地址列表
+     * 采用双缓冲（Double Buffering）机制实现路由链的无锁更新，确保在地址刷新期间业务调用的连续性与一致性
+     *
+     * @param invokers 新的服务提供者Invoker列表
+     * @param switchAction 用于切换Directory内部Invoker引用的回调动作，确保原子性更新
      */
     public synchronized void setInvokers(BitList<Invoker<T>> invokers, Runnable switchAction) {
         try {
             // Lock to prevent directory continue list
+            // 获取全局写锁，暂停新的调用进入路由选择阶段，为切换做准备
             lock.writeLock().lock();
 
             // Switch to back up chain. Will update main chain first.
+            // 将当前执行链指向备用链，确保后续新进来的调用暂时使用旧的路由规则，为主链更新腾出空间
             currentChain = backupChain;
         } finally {
             // Release lock to minimize the impact for each newly created invocations as much as possible.
             // Should not release lock until main chain update finished. Or this may cause long hang.
+            // 快速释放全局锁，减少对并发调用的阻塞时间
             lock.writeLock().unlock();
         }
 
         // Refresh main chain.
-        // No one can request to use main chain. `currentChain` is backup chain. `route` method cannot access main
+        // No one can request to use main chain. [currentChain](file:///Users/liupengyu/openCode/dubbo/self-dubbo-source/dubbo-cluster/src/main/java/org/apache/dubbo/rpc/cluster/RouterChain.java#L62-L62) is backup chain. [route](file:///Users/liupengyu/openCode/dubbo/self-dubbo-source/dubbo-compatible/src/main/java/com/alibaba/dubbo/rpc/cluster/Router.java#L33-L37) method cannot access main
         // chain.
         try {
             // Lock main chain to wait all invocation end
             // To wait until no one is using main chain.
+            // 获取主路由链的独立写锁，等待所有正在使用主链的调用执行完毕，确保数据静止
             mainChain.getLock().writeLock().lock();
 
             // refresh
+            // 利用最新的Invoker列表重建主路由链
             mainChain.setInvokers(invokers);
         } catch (Throwable t) {
             logger.error(LoggerCodeConstants.INTERNAL_ERROR, "", "", "Error occurred when refreshing router chain.", t);
@@ -208,46 +249,54 @@ public class RouterChain<T> {
         // Set the reference of newly invokers to temp variable.
         // Reason: The next step will switch the invokers reference in directory, so we should check the
         // `availableInvokers`
-        //         argument when `route`. If the current invocation use newly invokers, we should use main chain to
+        //         argument when [route](file:///Users/liupengyu/openCode/dubbo/self-dubbo-source/dubbo-compatible/src/main/java/com/alibaba/dubbo/rpc/cluster/Router.java#L33-L37). If the current invocation use newly invokers, we should use main chain to
         // route, and
         //         this can prevent use newly invokers to route backup chain, which can only route origin invokers now.
+        // 将新Invoker列表存入临时变量，用于在随后的切换窗口期辅助路由决策，防止新旧数据错配
         notifyingInvokers.set(invokers);
 
         // Switch the invokers reference in directory.
         // Cannot switch before update main chain or after backup chain update success. Or that will cause state
         // inconsistent.
+        // 执行Directory内部的引用切换，此时消费者获取到的将是最新的Invoker列表
         switchAction.run();
 
         try {
             // Lock to prevent directory continue list
             // The invokers reference in directory now should be the newly one and should always use the newly one once
             // lock released.
+            // 再次获取全局写锁，准备将流量正式切换到已更新好的主链上
             lock.writeLock().lock();
 
             // Switch to main chain. Will update backup chain later.
+            // 将当前执行链指向主链，完成核心的路由规则切换
             currentChain = mainChain;
 
             // Clean up temp variable.
-            // `availableInvokers` check is useless now, because `route` method will no longer receive any
+            // `availableInvokers` check is useless now, because [route](file:///Users/liupengyu/openCode/dubbo/self-dubbo-source/dubbo-compatible/src/main/java/com/alibaba/dubbo/rpc/cluster/Router.java#L33-L37) method will no longer receive any
             // `availableInvokers` related
             // with the origin invokers. The getter of invokers reference in directory is locked now, and will return
             // newly invokers
             // once lock released.
+            // 清理临时通知变量，切换过程结束，后续调用将统一使用新链和新地址
             notifyingInvokers.set(null);
         } finally {
             // Release lock to minimize the impact for each newly created invocations as much as possible.
             // Will use newly invokers and main chain now.
+            // 释放全局锁，恢复正常的并发调用
             lock.writeLock().unlock();
         }
 
         // Refresh main chain.
-        // No one can request to use main chain. `currentChain` is main chain. `route` method cannot access backup
+        // No one can request to use main chain. [currentChain](file:///Users/liupengyu/openCode/dubbo/self-dubbo-source/dubbo-cluster/src/main/java/org/apache/dubbo/rpc/cluster/RouterChain.java#L62-L62) is main chain. [route](file:///Users/liupengyu/openCode/dubbo/self-dubbo-source/dubbo-compatible/src/main/java/com/alibaba/dubbo/rpc/cluster/Router.java#L33-L37) method cannot access backup
         // chain.
         try {
             // Lock main chain to wait all invocation end
+            // 获取备用路由链的独立写锁，准备对其进行同步更新
             backupChain.getLock().writeLock().lock();
 
             // refresh
+            // 更新备用链，使其与主链保持一致，为下一次更新周期做准备
             backupChain.setInvokers(invokers);
         } catch (Throwable t) {
             logger.error(LoggerCodeConstants.INTERNAL_ERROR, "", "", "Error occurred when refreshing router chain.", t);
@@ -257,6 +306,7 @@ public class RouterChain<T> {
             backupChain.getLock().writeLock().unlock();
         }
     }
+
 
     public synchronized void destroy() {
         // 1. destroy another

@@ -31,6 +31,16 @@ import org.apache.dubbo.rpc.model.ModuleModel;
  * The abstract class of StateRoute.
  * @since 3.0
  */
+/**
+ * 抽象有状态路由器基类，实现了 StateRouter 接口的核心逻辑。
+ * 该类提供了路由链的模板方法模式实现，负责：
+ * 1. 管理路由器的链接关系（nextRouter）
+ * 2. 控制路由快照的构建和记录
+ * 3. 协调当前路由器与下一个路由器的执行流程
+ * 4. 提供快速失败机制的配置支持
+ *
+ * @param <T> 服务类型
+ */
 public abstract class AbstractStateRouter<T> implements StateRouter<T> {
     private volatile boolean force = false;
     private volatile URL url;
@@ -45,11 +55,18 @@ public abstract class AbstractStateRouter<T> implements StateRouter<T> {
 
     protected ModuleModel moduleModel;
 
+    /**
+     * 构造抽象有状态路由器实例。
+     *
+     * @param url 消费者 URL，用于获取模块模型和配置信息
+     */
     public AbstractStateRouter(URL url) {
+        // 获取模块模型并初始化规则仓库
         moduleModel = url.getOrDefaultModuleModel();
         this.ruleRepository =
                 moduleModel.getExtensionLoader(GovernanceRuleRepository.class).getDefaultExtension();
         this.url = url;
+        // 从配置中读取是否启用快速失败机制，默认为 true
         this.shouldFailFast = Boolean.parseBoolean(
                 ConfigurationUtils.getProperty(moduleModel, Constants.SHOULD_FAIL_FAST_KEY, "true"));
     }
@@ -90,6 +107,23 @@ public abstract class AbstractStateRouter<T> implements StateRouter<T> {
         // default empty implement
     }
 
+    /**
+     * 执行路由逻辑的模板方法。
+     * 该方法定义了路由执行的完整流程：
+     * 1. 如果需要打印消息，则构建当前路由器对应的快照节点
+     * 2. 调用子类实现的 doRoute 方法执行实际的路由逻辑
+     * 3. 将路由结果与原始调用者列表进行交集运算
+     * 4. 如果路由器不支持自行继续路由，则调用下一个路由器
+     * 5. 完成后更新快照节点的输出信息
+     *
+     * @param invokers 待路由的调用者列表
+     * @param url 消费者 URL
+     * @param invocation RPC 调用信息
+     * @param needToPrintMessage 是否需要打印路由快照消息
+     * @param nodeHolder 用于传递和返回路由快照节点的持有器
+     * @return 路由后的调用者列表
+     * @throws RpcException 路由过程中发生的异常
+     */
     @Override
     public final BitList<Invoker<T>> route(
             BitList<Invoker<T>> invokers,
@@ -98,6 +132,7 @@ public abstract class AbstractStateRouter<T> implements StateRouter<T> {
             boolean needToPrintMessage,
             Holder<RouterSnapshotNode<T>> nodeHolder)
             throws RpcException {
+        // 验证打印消息的参数有效性
         if (needToPrintMessage && (nodeHolder == null || nodeHolder.get() == null)) {
             needToPrintMessage = false;
         }
@@ -106,14 +141,14 @@ public abstract class AbstractStateRouter<T> implements StateRouter<T> {
         RouterSnapshotNode<T> parentNode = null;
         Holder<String> messageHolder = null;
 
-        // pre-build current node
+        // 如果需要打印消息，则预先构建当前节点和父节点的关系
         if (needToPrintMessage) {
             parentNode = nodeHolder.get();
             currentNode = new RouterSnapshotNode<>(this.getClass().getSimpleName(), invokers.clone());
             parentNode.appendNode(currentNode);
 
-            // set parent node's output size in the first child invoke
-            // initial node output size is zero, first child will override it
+            // 在第一个子节点调用时设置父节点的输出大小
+            // 初始节点输出大小为零，第一个子节点会覆盖它
             if (parentNode.getNodeOutputSize() < invokers.size()) {
                 parentNode.setNodeOutputInvokers(invokers.clone());
             }
@@ -123,23 +158,25 @@ public abstract class AbstractStateRouter<T> implements StateRouter<T> {
         }
         BitList<Invoker<T>> routeResult;
 
+        // 调用子类实现的具体路由逻辑
         routeResult = doRoute(invokers, url, invocation, needToPrintMessage, nodeHolder, messageHolder);
+        // 将路由结果与原始调用者列表取交集，确保结果的正确性
         if (routeResult != invokers) {
             routeResult = invokers.and(routeResult);
         }
-        // check if router support call continue route by itself
+        // 检查路由器是否支持自行调用继续路由
         if (!supportContinueRoute()) {
-            // use current node's result as next node's parameter
+            // 使用当前节点的结果作为下一个节点的参数
             if (!shouldFailFast || !routeResult.isEmpty()) {
                 routeResult = continueRoute(routeResult, url, invocation, needToPrintMessage, nodeHolder);
             }
         }
 
-        // post-build current node
+        // 如果需要打印消息，则后置处理当前节点的快照信息
         if (needToPrintMessage) {
             currentNode.setRouterMessage(messageHolder.get());
             if (currentNode.getNodeOutputSize() == 0) {
-                // no child call
+                // 没有子节点调用，设置当前节点的输出
                 currentNode.setNodeOutputInvokers(routeResult.clone());
             }
             currentNode.setChainOutputInvokers(routeResult.clone());
@@ -149,15 +186,17 @@ public abstract class AbstractStateRouter<T> implements StateRouter<T> {
     }
 
     /**
-     * Filter invokers with current routing rule and only return the invokers that comply with the rule.
+     * 使用当前路由规则过滤调用者，只返回符合规则的调用者。
+     * 子类必须实现此方法来定义具体的路由逻辑。
      *
-     * @param invokers all invokers to be routed
-     * @param url consumerUrl
-     * @param invocation invocation
-     * @param needToPrintMessage should current router print message
-     * @param nodeHolder RouterSnapshotNode In general, router itself no need to care this param, just pass to continueRoute
-     * @param messageHolder message holder when router should current router print message
-     * @return routed result
+     * @param invokers 待路由的所有调用者
+     * @param url 消费者 URL
+     * @param invocation RPC 调用信息
+     * @param needToPrintMessage 当前路由器是否需要打印消息
+     * @param nodeHolder 路由快照节点持有器，一般路由器本身无需关心此参数，只需传递给 continueRoute
+     * @param messageHolder 当路由器需要打印消息时的消息持有器
+     * @return 路由后的结果
+     * @throws RpcException 路由过程中发生的异常
      */
     protected abstract BitList<Invoker<T>> doRoute(
             BitList<Invoker<T>> invokers,
@@ -169,9 +208,16 @@ public abstract class AbstractStateRouter<T> implements StateRouter<T> {
             throws RpcException;
 
     /**
-     * Call next router to get result
+     * 调用下一个路由器获取结果。
+     * 如果存在下一个路由器，则将当前路由结果传递给下一个路由器继续处理；
+     * 否则直接返回当前的调用者列表。
      *
-     * @param invokers current router filtered invokers
+     * @param invokers 当前路由器过滤后的调用者列表
+     * @param url 消费者 URL
+     * @param invocation RPC 调用信息
+     * @param needToPrintMessage 是否需要打印消息
+     * @param nodeHolder 路由快照节点持有器
+     * @return 继续路由后的调用者列表
      */
     protected final BitList<Invoker<T>> continueRoute(
             BitList<Invoker<T>> invokers,
@@ -179,28 +225,33 @@ public abstract class AbstractStateRouter<T> implements StateRouter<T> {
             Invocation invocation,
             boolean needToPrintMessage,
             Holder<RouterSnapshotNode<T>> nodeHolder) {
+        // 如果存在下一个路由器，则调用其 route 方法
         if (nextRouter != null) {
             return nextRouter.route(invokers, url, invocation, needToPrintMessage, nodeHolder);
         } else {
+            // 否则直接返回当前的调用者列表
             return invokers;
         }
     }
 
     /**
-     * Whether current router's implementation support call
-     * {@link AbstractStateRouter#continueRoute(BitList, URL, Invocation, boolean, Holder)}
-     * by router itself.
+     * 判断当前路由器的实现是否支持自行调用继续路由。
+     * 如果返回 false，则由 AbstractStateRouter 的 route 方法负责调用 continueRoute；
+     * 如果返回 true，则子类需要在 doRoute 中自行处理继续路由的逻辑。
      *
-     * @return support or not
+     * @return 是否支持自行继续路由，默认为 false
      */
     protected boolean supportContinueRoute() {
         return false;
     }
 
     /**
-     * Next Router node state is maintained by AbstractStateRouter and this method is not allow to override.
-     * If a specified router wants to control the behaviour of continue route or not,
-     * please override {@link AbstractStateRouter#supportContinueRoute()}
+     * 设置下一个路由器节点。
+     * 该方法由 AbstractStateRouter 维护，不允许子类重写。
+     * 如果指定的路由器想要控制继续路由的行为，
+     * 请重写 {@link AbstractStateRouter#supportContinueRoute()} 方法。
+     *
+     * @param nextRouter 下一个路由器实例
      */
     @Override
     public final void setNextRouter(StateRouter<T> nextRouter) {
@@ -212,6 +263,13 @@ public abstract class AbstractStateRouter<T> implements StateRouter<T> {
         return doBuildSnapshot() + "            v \n" + nextRouter.buildSnapshot();
     }
 
+    /**
+     * 构建当前路由器的快照字符串表示。
+     * 默认实现表明当前路由器不支持快照功能。
+     * 子类可以重写此方法以提供自定义的快照信息。
+     *
+     * @return 当前路由器的快照字符串
+     */
     protected String doBuildSnapshot() {
         return this.getClass().getSimpleName() + " not support\n";
     }

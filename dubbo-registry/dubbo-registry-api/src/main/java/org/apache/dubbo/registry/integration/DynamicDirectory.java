@@ -58,68 +58,82 @@ import static org.apache.dubbo.registry.integration.InterfaceCompatibleRegistryP
 import static org.apache.dubbo.remoting.Constants.CHECK_KEY;
 
 /**
- * DynamicDirectory
+ * 动态服务目录实现，负责从注册中心订阅服务提供者列表并管理Invoker生命周期
+ * 实现了NotifyListener接口以接收注册中心的变更通知，并支持路由链的动态筛选
+ *
+ * @param <T> 服务接口类型
  */
 public abstract class DynamicDirectory<T> extends AbstractDirectory<T> implements NotifyListener {
 
     private static final ErrorTypeAwareLogger logger = LoggerFactory.getErrorTypeAwareLogger(DynamicDirectory.class);
 
+    /** 集群容错策略扩展，用于将多个Invoker合并为一个虚拟Invoker */
     protected final Cluster cluster;
 
+    /** 路由器工厂扩展，用于创建路由链 */
     protected final RouterFactory routerFactory;
 
     /**
-     * Initialization at construction time, assertion not null
+     * 服务键，在构造时初始化，不为null
+     * 格式通常为：interface:version:group
      */
     protected final String serviceKey;
 
     /**
-     * Initialization at construction time, assertion not null
+     * 服务接口类型，在构造时初始化，不为null
      */
     protected final Class<T> serviceType;
 
     /**
-     * Initialization at construction time, assertion not null, and always assign non-null value
+     * 当前生效的消费者URL，在构造时初始化并始终非空
+     * 会随着配置中心的动态配置更新而改变
      */
     protected volatile URL directoryUrl;
 
+    /** 是否属于多分组场景，如group="*"或"group1,group2" */
     protected final boolean multiGroup;
 
     /**
-     * Initialization at the time of injection, the assertion is not null
+     * 协议层引用，在注入时初始化，不为null
+     * 用于将URL转换为具体的Invoker对象
      */
     protected Protocol protocol;
 
     /**
-     * Initialization at the time of injection, the assertion is not null
+     * 注册中心引用，在注入时初始化，不为null
+     * 用于执行订阅、反订阅及注销操作
      */
     protected Registry registry;
 
+    /** 标识服务是否已被禁用，禁用后不再进行路由选择 */
     protected volatile boolean forbidden = false;
+
+    /** 是否应该将消费者URL注册到注册中心 */
     protected boolean shouldRegister;
+
+    /** 是否应该简化注册的URL参数 */
     protected boolean shouldSimplified;
 
     /**
-     * Initialization at construction time, assertion not null, and always assign not null value
+     * 订阅注册中心使用的URL，在构造时初始化并始终非空
      */
     protected volatile URL subscribeUrl;
 
+    /** 实际注册到注册中心或元数据中心的消费者URL */
     protected volatile URL registeredConsumerUrl;
 
     /**
-     * The initial value is null and the midway may be assigned to null, please use the local variable reference
-     * override rules
-     * Priority: override>-D>consumer>provider
-     * Rule one: for a certain provider <ip:port,timeout=100>
-     * Rule two: for all providers <* ,timeout=5000>
+     * 配置器列表，初始值为null，中途可能变为null，请使用局部变量引用
+     * 覆盖规则优先级：override > -D > consumer > provider
+     * 规则一：针对特定提供者 <ip:port,timeout=100>
+     * 规则二：针对所有提供者 <* ,timeout=5000>
      */
     protected volatile List<Configurator> configurators;
 
+    /** 服务实例变更监听器，用于应用级服务发现 */
     protected ServiceInstancesChangedListener serviceListener;
 
-    /**
-     * Should continue route if directory is empty
-     */
+    /** 当目录为空时是否快速失败 */
     private final boolean shouldFailFast;
 
     private volatile InvokersChangedListener invokersChangedListener;
@@ -181,7 +195,7 @@ public abstract class DynamicDirectory<T> extends AbstractDirectory<T> implement
         return shouldRegister;
     }
 
-        /**
+    /**
      * 向注册中心订阅服务目录，注册当前目录对象作为通知监听者。
      * <p>
      * 该方法建立与注册中心的订阅关系，使得当服务提供者列表发生变化时（如新增、下线、配置变更等），
@@ -330,7 +344,7 @@ public abstract class DynamicDirectory<T> extends AbstractDirectory<T> implement
         }
     }
 
-        /**
+    /**
      * 基于指定的URL构建路由链，初始化所有激活的路由规则。
      * <p>
      * 该方法调用RouterChain.buildChain()静态方法，根据服务接口类型和URL中的配置参数（如条件路由、标签路由等），

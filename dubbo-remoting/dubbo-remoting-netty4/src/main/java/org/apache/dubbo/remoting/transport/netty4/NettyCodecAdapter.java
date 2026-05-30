@@ -33,6 +33,8 @@ import io.netty.handler.codec.MessageToByteEncoder;
 
 /**
  * NettyCodecAdapter.
+ * Netty 编解码器适配器，将 Dubbo 的 Codec2 接口适配为 Netty 的 ChannelHandler（编码器和解码器）。
+ * 该类内部维护了 InternalEncoder 和 InternalDecoder 两个私有类，分别处理出站消息的序列化和入站消息的反序列化。
  */
 public final class NettyCodecAdapter {
 
@@ -46,6 +48,13 @@ public final class NettyCodecAdapter {
 
     private final org.apache.dubbo.remoting.ChannelHandler handler;
 
+    /**
+     * 构造 NettyCodecAdapter 实例。
+     *
+     * @param codec Dubbo 编解码器实现
+     * @param url 服务 URL，包含配置信息
+     * @param handler Dubbo 通道处理器
+     */
     public NettyCodecAdapter(Codec2 codec, URL url, org.apache.dubbo.remoting.ChannelHandler handler) {
         this.codec = codec;
         this.url = url;
@@ -60,61 +69,82 @@ public final class NettyCodecAdapter {
         return decoder;
     }
 
+    /**
+     * 内部编码器，继承自 Netty 的 MessageToByteEncoder。
+     * 负责将 Dubbo 的消息对象转换为 ByteBuf 字节流。
+     */
     private class InternalEncoder extends MessageToByteEncoder {
 
         @Override
         protected void encode(ChannelHandlerContext ctx, Object msg, ByteBuf out) throws Exception {
             boolean encoded = false;
+            // 如果消息已经是 ByteBuf 类型，直接写入输出缓冲区
             if (msg instanceof ByteBuf) {
                 out.writeBytes(((ByteBuf) msg));
                 encoded = true;
             } else if (msg instanceof MultiMessage) {
+                // 如果是批量消息，循环处理其中的每个子消息
                 for (Object singleMessage : ((MultiMessage) msg)) {
                     if (singleMessage instanceof ByteBuf) {
                         ByteBuf buf = (ByteBuf) singleMessage;
                         out.writeBytes(buf);
                         encoded = true;
+                        // 释放已处理的 ByteBuf 引用计数
                         buf.release();
                     }
                 }
             }
 
+            // 如果尚未被处理，则调用 Dubbo Codec2 进行标准编码
             if (!encoded) {
+                // 将 Netty 的 ByteBuf 包装为 Dubbo 的 ChannelBuffer
                 ChannelBuffer buffer = new NettyBackedChannelBuffer(out);
                 Channel ch = ctx.channel();
+                // 获取或创建关联的 Dubbo NettyChannel
                 NettyChannel channel = NettyChannel.getOrAddChannel(ch, url, handler);
                 codec.encode(channel, buffer, msg);
             }
         }
     }
 
+    /**
+     * 内部解码器，继承自 Netty 的 ByteToMessageDecoder。
+     * 负责将接收到的 ByteBuf 字节流解码为 Dubbo 的消息对象（Request 或 Response）。
+     */
     private class InternalDecoder extends ByteToMessageDecoder {
 
         @Override
         protected void decode(ChannelHandlerContext ctx, ByteBuf input, List<Object> out) throws Exception {
 
+            // 将 Netty 的 ByteBuf 包装为 Dubbo 的 ChannelBuffer
             ChannelBuffer message = new NettyBackedChannelBuffer(input);
             try {
+                // 获取或创建关联的 Dubbo NettyChannel
                 NettyChannel channel = NettyChannel.getOrAddChannel(ctx.channel(), url, handler);
 
                 // decode object.
+                // 循环解码，直到缓冲区中没有足够的数据为止
                 do {
+                    // 记录当前的读取位置，以便在数据不足时回退
                     int saveReaderIndex = message.readerIndex();
                     Object msg = codec.decode(channel, message);
+                    // 如果数据不足，回退指针并跳出循环，等待更多数据
                     if (msg == Codec2.DecodeResult.NEED_MORE_INPUT) {
                         message.readerIndex(saveReaderIndex);
                         break;
                     } else {
-                        // is it possible to go here ?
+                        // 检查是否发生了没有读取任何数据的异常情况
                         if (saveReaderIndex == message.readerIndex()) {
                             throw new IOException("Decode without read data.");
                         }
+                        // 将解码成功的消息加入输出列表，交给下一个 Handler 处理
                         if (msg != null) {
                             out.add(msg);
                         }
                     }
                 } while (message.readable());
             } catch (Throwable t) {
+                // 发生异常时，跳过剩余的所有字节，防止脏数据影响后续连接
                 message.skipBytes(message.readableBytes());
                 throw t;
             }

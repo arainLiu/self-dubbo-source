@@ -55,29 +55,56 @@ import static org.apache.dubbo.common.constants.CommonConstants.METHODS_KEY;
 import static org.apache.dubbo.common.constants.CommonConstants.TIMESTAMP_KEY;
 import static org.apache.dubbo.metadata.RevisionResolver.EMPTY_REVISION;
 
+/**
+ * 应用级元数据信息容器，用于存储和上报服务接口的完整描述信息
+ * 在Dubbo3应用级服务发现中，该对象承载了应用名称、服务列表、版本分组及配置参数，
+ * 并通过计算Revision实现元数据变更的高效检测与增量同步
+ */
 public class MetadataInfo implements Serializable {
     public static final MetadataInfo EMPTY = new MetadataInfo();
     private static final Logger logger = LoggerFactory.getLogger(MetadataInfo.class);
 
+    /** 所属应用名称 */
     private String app;
+
     // revision that will report to registry or remote meta center, must always update together with rawMetadataInfo,
     // check {@link this#calAndGetRevision}
+    /** 元数据版本号，用于标识当前元数据内容的唯一指纹，内容变更时自动更新 */
     private volatile String revision;
+
     // key format is '{group}/{interface name}:{version}:{protocol}'
+    /** 服务信息映射表，Key为包含协议的完整服务键 */
     private final Map<String, ServiceInfo> services;
 
     /* used at runtime */
+    /** 初始化状态标志，确保反序列化后的懒加载逻辑只执行一次 */
     private transient AtomicBoolean initiated = new AtomicBoolean(false);
+
     // Json formatted metadata that will report to remote meta center, must always update together with revision, check
     // {@link this#calAndGetRevision}
+    /** 序列化后的JSON格式元数据字符串，用于直接上报给远程元数据中心 */
     private transient volatile String rawMetadataInfo;
+
     // key format is '{group}/{interface name}:{version}'
+    /** 订阅服务映射表，Key为不包含协议的服务键，用于消费者侧快速查找 */
     private transient Map<String, Set<ServiceInfo>> subscribedServices;
+
+    /** 扩展参数集合，用于存放非标准配置的额外信息 */
     private final transient Map<String, String> extendParams;
+
+    /** 实例级通用参数集合，如应用名、环境标签等，所有服务共享 */
     private final transient Map<String, String> instanceParams;
+
+    /** 元数据更新标记，当有服务增删或参数变更时置为true，触发Revision重算 */
     protected transient volatile boolean updated = false;
+
+    /** 已订阅的服务URL缓存，按服务键组织 */
     private transient ConcurrentNavigableMap<String, SortedSet<URL>> subscribedServiceURLs;
+
+    /** 已导出的服务URL缓存，按服务键组织 */
     private transient ConcurrentNavigableMap<String, SortedSet<URL>> exportedServiceURLs;
+
+    /** SPI扩展加载器，用于获取元数据参数过滤器 */
     private transient ExtensionLoader<MetadataParamsFilter> loader;
 
     public MetadataInfo() {
@@ -199,6 +226,11 @@ public class MetadataInfo implements Serializable {
         updated = true;
     }
 
+    /**
+     * 从元数据信息中移除指定的服务
+     *
+     * @param url 需要移除的服务URL
+     */
     public synchronized void removeService(URL url) {
         if (url == null) {
             return;
@@ -244,6 +276,12 @@ public class MetadataInfo implements Serializable {
         return revision;
     }
 
+    /**
+     * 计算当前元数据内容的摘要版本号
+     * 通过拼接应用名和所有服务的描述字符串，生成唯一的Revision标识
+     *
+     * @return 计算得到的Revision字符串
+     */
     public synchronized String calRevision() {
         StringBuilder sb = new StringBuilder();
         sb.append(app);
@@ -439,6 +477,12 @@ public class MetadataInfo implements Serializable {
                         || (services != null && services.equals(other.services)));
     }
 
+    /**
+     * 从URL中提取实例级别的通用参数并存储到instanceParams中
+     *
+     * @param url 服务URL
+     * @param filters 参数过滤器列表，决定哪些参数应该被提取
+     */
     private void extractInstanceParams(URL url, List<MetadataParamsFilter> filters) {
         if (CollectionUtils.isEmpty(filters)) {
             return;
@@ -529,6 +573,9 @@ public class MetadataInfo implements Serializable {
         return new MetadataInfo(this.app, this.revision, this.services);
     }
 
+    /**
+     * 单个服务接口的元数据详情，包含接口定义、版本分组、协议及配置参数
+     */
     public static class ServiceInfo implements Serializable {
         private String name;
         private String group;
@@ -593,6 +640,13 @@ public class MetadataInfo implements Serializable {
             this.matchKey = buildMatchKey();
         }
 
+        /**
+         * 根据过滤器规则从URL中提取服务级别的配置参数
+         *
+         * @param url 服务URL
+         * @param filters 参数过滤器列表
+         * @return 提取出的参数Map
+         */
         private Map<String, String> extractServiceParams(URL url, List<MetadataParamsFilter> filters) {
             Map<String, String> params = new HashMap<>();
 
@@ -832,7 +886,7 @@ public class MetadataInfo implements Serializable {
 
         public String toDescString() {
             return this.getMatchKey() + port + path + new TreeMap<>(getParams());
-        }
+            }
 
         public void addParameter(String key, String value) {
             if (consumerParams != null) {

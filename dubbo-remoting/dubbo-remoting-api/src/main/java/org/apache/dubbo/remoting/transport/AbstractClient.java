@@ -48,6 +48,17 @@ import static org.apache.dubbo.remoting.Constants.LEAST_RECONNECT_DURATION;
 import static org.apache.dubbo.remoting.Constants.LEAST_RECONNECT_DURATION_KEY;
 import static org.apache.dubbo.remoting.utils.UrlUtils.getIdleTimeout;
 
+/**
+ * 抽象客户端实现类，继承自 AbstractEndpoint 并实现 Client 接口。
+ * 该类提供了客户端连接管理的核心逻辑，包括：
+ * 1. 连接的建立、断开和重连机制
+ * 2. 线程池的初始化与管理
+ * 3. 懒加载（Lazy Connect）支持
+ * 4. 连接状态的同步控制（使用 ReentrantLock）
+ * 5. 消息发送前的连通性检查
+ *
+ * 具体的通信协议实现（如 Netty, Mina 等）需要继承此类并实现 doOpen, doClose, doConnect, doDisConnect 等抽象方法。
+ */
 public abstract class AbstractClient extends AbstractEndpoint implements Client {
 
     private Lock connectLock;
@@ -62,22 +73,31 @@ public abstract class AbstractClient extends AbstractEndpoint implements Client 
 
     protected long reconnectDuration;
 
+    /**
+     * 构造 AbstractClient 实例并尝试建立连接。
+     *
+     * @param url 客户端配置 URL
+     * @param handler 处理网络事件的 ChannelHandler
+     * @throws RemotingException 如果启动或连接失败且未配置懒加载或忽略检查
+     */
     public AbstractClient(URL url, ChannelHandler handler) throws RemotingException {
         super(url, handler);
 
-        // initialize connectLock before calling connect()
+        // 在调用 connect() 之前初始化连接锁
         connectLock = new ReentrantLock();
 
-        // set default needReconnect true when channel is not connected
+        // 默认设置需要重连，除非显式配置为 false
         needReconnect = url.getParameter(Constants.SEND_RECONNECT_KEY, true);
 
         frameworkModel = url.getOrDefaultFrameworkModel();
 
+        // 初始化客户端执行器线程池
         initExecutor(url);
 
         reconnectDuration = getReconnectDuration(url);
 
         try {
+            // 打开底层通信组件（如 Netty Bootstrap）
             doOpen();
         } catch (Throwable t) {
             close();
@@ -90,15 +110,14 @@ public abstract class AbstractClient extends AbstractEndpoint implements Client 
         }
 
         try {
-            // connect.
+            // 尝试连接到服务端
             connect();
             if (logger.isInfoEnabled()) {
                 logger.info("Start " + getClass().getSimpleName() + " " + NetUtils.getLocalAddress()
                         + " connect to the server " + getRemoteAddress());
             }
         } catch (RemotingException t) {
-            // If lazy connect client fails to establish a connection, the client instance will still be created,
-            // and the reconnection will be initiated by ReconnectTask, so there is no need to throw an exception
+            // 如果是懒加载客户端，连接失败不抛出异常，由后台重连任务负责重试
             if (url.getParameter(LAZY_CONNECT_KEY, false)) {
                 logger.warn(
                         TRANSPORT_FAILED_CONNECT_PROVIDER,
@@ -113,10 +132,12 @@ public abstract class AbstractClient extends AbstractEndpoint implements Client 
                 return;
             }
 
+            // 如果配置了启动时检查（check=true），则关闭客户端并抛出异常
             if (url.getParameter(Constants.CHECK_KEY, true)) {
                 close();
                 throw t;
             } else {
+                // 如果 check=false，则记录警告日志，允许客户端继续运行并稍后重试
                 logger.warn(
                         TRANSPORT_FAILED_CONNECT_PROVIDER,
                         "",
@@ -142,6 +163,12 @@ public abstract class AbstractClient extends AbstractEndpoint implements Client 
         frameworkModel = null;
     }
 
+    /**
+     * 初始化客户端使用的线程池。
+     * 根据 URL 配置创建或获取共享的执行器，并初始化用于连通性检查的调度线程池。
+     *
+     * @param url 配置 URL
+     */
     private void initExecutor(URL url) {
         ExecutorRepository executorRepository = ExecutorRepository.getInstance(url.getOrDefaultApplicationModel());
 
@@ -151,10 +178,12 @@ public abstract class AbstractClient extends AbstractEndpoint implements Client 
          * Instance of url is InstanceAddressURL, so addParameter actually adds parameters into ServiceInstance,
          * which means params are shared among different services. Since client is shared among services this is currently not a problem.
          */
+        // 设置线程名称和默认的线程池类型
         url = url.addParameter(THREAD_NAME_KEY, CLIENT_THREAD_POOL_NAME)
                 .addParameterIfAbsent(THREADPOOL_KEY, DEFAULT_CLIENT_THREADPOOL);
         executor = executorRepository.createExecutorIfAbsent(url);
 
+        // 从框架模型中获取用于连通性检查的调度线程池
         connectivityExecutor = frameworkModel
                 .getBeanFactory()
                 .getBean(FrameworkExecutorRepository.class)
@@ -232,27 +261,45 @@ public abstract class AbstractClient extends AbstractEndpoint implements Client 
         return channel.hasAttribute(key);
     }
 
+    /**
+     * 发送消息到服务端。
+     * 如果配置了需要重连且当前未连接，则先尝试建立连接。
+     *
+     * @param message 要发送的消息对象
+     * @param sent 是否等待消息真正发送成功
+     * @throws RemotingException 如果通道已关闭或发送失败
+     */
     @Override
     public void send(Object message, boolean sent) throws RemotingException {
+        // 如果需要重连且当前未连接，则触发连接操作
         if (needReconnect && !isConnected()) {
             connect();
         }
         Channel channel = getChannel();
         // TODO Can the value returned by getChannel() be null? need improvement.
+        // 再次检查通道状态，确保消息能正常发送
         if (channel == null || !channel.isConnected()) {
             throw new RemotingException(this, "message can not send, because channel is closed . url:" + getUrl());
         }
         channel.send(message, sent);
     }
 
+    /**
+     * 建立到服务端的连接。
+     * 该方法使用锁保证线程安全，防止并发连接操作。
+     *
+     * @throws RemotingException 如果连接失败
+     */
     protected void connect() throws RemotingException {
         connectLock.lock();
 
         try {
+            // 如果已经连接，直接返回
             if (isConnected()) {
                 return;
             }
 
+            // 如果客户端正在关闭或已关闭，则放弃连接
             if (isClosed() || isClosing()) {
                 logger.warn(
                         TRANSPORT_FAILED_CONNECT_PROVIDER,
@@ -264,8 +311,10 @@ public abstract class AbstractClient extends AbstractEndpoint implements Client 
                 return;
             }
 
+            // 调用子类实现的具体连接逻辑
             doConnect();
 
+            // 验证连接结果
             if (!isConnected()) {
                 throw new RemotingException(
                         this,
@@ -300,10 +349,15 @@ public abstract class AbstractClient extends AbstractEndpoint implements Client 
         }
     }
 
+    /**
+     * 断开与服务端的连接。
+     * 该方法会关闭底层通道并调用子类的断开逻辑。
+     */
     public void disconnect() {
         connectLock.lock();
         try {
             try {
+                // 关闭底层通道
                 Channel channel = getChannel();
                 if (channel != null) {
                     channel.close();
@@ -312,6 +366,7 @@ public abstract class AbstractClient extends AbstractEndpoint implements Client 
                 logger.warn(TRANSPORT_FAILED_CLOSE, "", "", e.getMessage(), e);
             }
             try {
+                // 调用子类实现的断开逻辑
                 doDisConnect();
             } catch (Throwable e) {
                 logger.warn(TRANSPORT_FAILED_CLOSE, "", "", e.getMessage(), e);
@@ -321,12 +376,24 @@ public abstract class AbstractClient extends AbstractEndpoint implements Client 
         }
     }
 
+    /**
+     * 计算重连任务的执行间隔。
+     *
+     * @param url 配置 URL
+     * @return 重连间隔时间（毫秒）
+     */
     private long getReconnectDuration(URL url) {
         int idleTimeout = getIdleTimeout(url);
         long heartbeatTimeoutTick = calculateLeastDuration(idleTimeout);
         return calculateReconnectDuration(url, heartbeatTimeoutTick);
     }
 
+    /**
+     * 计算最小的任务执行间隔，防止间隔过小导致性能问题。
+     *
+     * @param time 原始时间间隔
+     * @return 计算后的最小间隔
+     */
     private long calculateLeastDuration(int time) {
         if (time / HEARTBEAT_CHECK_TICK <= 0) {
             return LEAST_HEARTBEAT_DURATION;
@@ -335,11 +402,24 @@ public abstract class AbstractClient extends AbstractEndpoint implements Client 
         }
     }
 
+    /**
+     * 计算最终的重连持续时间，确保不小于配置的最小值。
+     *
+     * @param url 配置 URL
+     * @param tick 基础时间间隔
+     * @return 最终的重连间隔
+     */
     private long calculateReconnectDuration(URL url, long tick) {
         long leastReconnectDuration = url.getParameter(LEAST_RECONNECT_DURATION_KEY, LEAST_RECONNECT_DURATION);
         return Math.max(leastReconnectDuration, tick);
     }
 
+    /**
+     * 重新连接到服务端。
+     * 该方法会先断开现有连接，然后重新发起连接。
+     *
+     * @throws RemotingException 如果重连失败
+     */
     @Override
     public void reconnect() throws RemotingException {
         connectLock.lock();
@@ -351,6 +431,10 @@ public abstract class AbstractClient extends AbstractEndpoint implements Client 
         }
     }
 
+    /**
+     * 关闭客户端。
+     * 该方法会依次关闭父类资源、断开连接并调用子类的关闭逻辑。
+     */
     @Override
     public void close() {
         if (isClosed()) {
@@ -366,6 +450,7 @@ public abstract class AbstractClient extends AbstractEndpoint implements Client 
 
         connectLock.lock();
         try {
+            // 双重检查，防止并发关闭
             if (isClosed()) {
                 logger.warn(
                         TRANSPORT_FAILED_CONNECT_PROVIDER,
@@ -378,18 +463,21 @@ public abstract class AbstractClient extends AbstractEndpoint implements Client 
             }
 
             try {
+                // 关闭父类资源
                 super.close();
             } catch (Throwable e) {
                 logger.warn(TRANSPORT_FAILED_CLOSE, "", "", e.getMessage(), e);
             }
 
             try {
+                // 断开网络连接
                 disconnect();
             } catch (Throwable e) {
                 logger.warn(TRANSPORT_FAILED_CLOSE, "", "", e.getMessage(), e);
             }
 
             try {
+                // 调用子类实现的关闭逻辑
                 doClose();
             } catch (Throwable e) {
                 logger.warn(TRANSPORT_FAILED_CLOSE, "", "", e.getMessage(), e);
@@ -412,26 +500,36 @@ public abstract class AbstractClient extends AbstractEndpoint implements Client 
 
     /**
      * Open client.
+     * 打开客户端底层通信组件。
+     * @throws Throwable 打开过程中发生的异常
      */
     protected abstract void doOpen() throws Throwable;
 
     /**
      * Close client.
+     * 关闭客户端底层通信组件。
+     * @throws Throwable 关闭过程中发生的异常
      */
     protected abstract void doClose() throws Throwable;
 
     /**
      * Connect to server.
+     * 建立到服务端的物理连接。
+     * @throws Throwable 连接过程中发生的异常
      */
     protected abstract void doConnect() throws Throwable;
 
     /**
      * disConnect to server.
+     * 断开到服务端的物理连接。
+     * @throws Throwable 断开过程中发生的异常
      */
     protected abstract void doDisConnect() throws Throwable;
 
     /**
      * Get the connected channel.
+     * 获取当前已连接的通道实例。
+     * @return 已连接的 Channel 对象，如果未连接则返回 null
      */
     protected abstract Channel getChannel();
 }

@@ -41,6 +41,14 @@ import static org.apache.dubbo.common.constants.LoggerCodeConstants.TRANSPORT_FA
 
 /**
  * ExchangeReceiver
+ * 基于 Header 协议的交换层通道实现。
+ * 该类包装了底层的 Remoting Channel，实现了请求-响应模式的通信逻辑。
+ *
+ * 核心职责：
+ * 1. 将普通的消息对象包装为 Request/Response 对象
+ * 2. 管理 DefaultFuture，建立请求 ID 与响应 Future 的映射关系
+ * 3. 处理通道的优雅关闭，确保在关闭前等待未完成的请求完成
+ * 4. 提供线程安全的通道状态管理和属性操作
  */
 final class HeaderExchangeChannel implements ExchangeChannel {
 
@@ -55,24 +63,41 @@ final class HeaderExchangeChannel implements ExchangeChannel {
 
     private volatile boolean closed = false;
 
+    /**
+     * 构造 HeaderExchangeChannel 实例。
+     *
+     * @param channel 底层的 Remoting Channel 实例，不能为空
+     * @throws IllegalArgumentException 如果 channel 为空
+     */
     HeaderExchangeChannel(Channel channel) {
         if (channel == null) {
             throw new IllegalArgumentException("channel == null");
         }
         this.channel = channel;
+        // 从配置中获取服务端关闭超时时间，用于优雅关闭
         this.shutdownTimeout = Optional.ofNullable(channel.getUrl())
                 .map(URL::getOrDefaultApplicationModel)
                 .map(ConfigurationUtils::getServerShutdownTimeout)
                 .orElse(DEFAULT_TIMEOUT);
     }
 
+    /**
+     * 获取或创建与底层 Channel 关联的 HeaderExchangeChannel 实例。
+     * 该方法使用 Channel 的属性存储来缓存 ExchangeChannel，确保同一个底层 Channel 只对应一个 ExchangeChannel。
+     *
+     * @param ch 底层的 Remoting Channel
+     * @return 关联的 HeaderExchangeChannel 实例，如果 ch 为空则返回 null
+     */
     static HeaderExchangeChannel getOrAddChannel(Channel ch) {
         if (ch == null) {
             return null;
         }
+        // 尝试从 Channel 属性中获取已存在的 HeaderExchangeChannel
         HeaderExchangeChannel ret = (HeaderExchangeChannel) ch.getAttribute(CHANNEL_KEY);
         if (ret == null) {
+            // 如果不存在则创建新的实例
             ret = new HeaderExchangeChannel(ch);
+            // 只有当 Channel 处于连接状态时才设置属性，避免无效缓存
             if (ch.isConnected()) {
                 ch.setAttribute(CHANNEL_KEY, ret);
             }
@@ -80,12 +105,23 @@ final class HeaderExchangeChannel implements ExchangeChannel {
         return ret;
     }
 
+    /**
+     * 如果 Channel 已断开连接，则移除其关联的 HeaderExchangeChannel 属性。
+     * 用于在连接断开时清理缓存，防止内存泄漏。
+     *
+     * @param ch 底层的 Remoting Channel
+     */
     static void removeChannelIfDisconnected(Channel ch) {
         if (ch != null && !ch.isConnected()) {
             ch.removeAttribute(CHANNEL_KEY);
         }
     }
 
+    /**
+     * 移除 Channel 关联的 HeaderExchangeChannel 属性。
+     *
+     * @param ch 底层的 Remoting Channel
+     */
     static void removeChannel(Channel ch) {
         if (ch != null) {
             ch.removeAttribute(CHANNEL_KEY);
@@ -97,17 +133,28 @@ final class HeaderExchangeChannel implements ExchangeChannel {
         send(message, false);
     }
 
+    /**
+     * 发送消息到远程端。
+     * 如果消息不是 Request、Response 或 String 类型，则会自动包装为单向 Request 对象。
+     *
+     * @param message 要发送的消息对象
+     * @param sent 如果为 true，则等待消息真正发送成功后才返回（取决于底层实现）
+     * @throws RemotingException 如果通道已关闭或发送失败
+     */
     @Override
     public void send(Object message, boolean sent) throws RemotingException {
+        // 检查通道是否已关闭
         if (closed) {
             throw new RemotingException(
                     this.getLocalAddress(),
                     null,
                     "Failed to send message " + message + ", cause: The channel " + this + " is closed!");
         }
+        // 如果消息已经是支持的类型，直接发送
         if (message instanceof Request || message instanceof Response || message instanceof String) {
             channel.send(message, sent);
         } else {
+            // 否则将消息包装为单向 Request 对象
             Request request = new Request();
             request.setVersion(Version.getProtocolVersion());
             request.setTwoWay(false);
@@ -192,6 +239,10 @@ final class HeaderExchangeChannel implements ExchangeChannel {
         return closed;
     }
 
+    /**
+     * 关闭当前通道。
+     * 该方法会触发优雅关闭流程，通知所有等待的 DefaultFuture 通道即将关闭。
+     */
     @Override
     public void close() {
         if (closed) {
@@ -200,12 +251,14 @@ final class HeaderExchangeChannel implements ExchangeChannel {
         closed = true;
         try {
             // graceful close
+            // 优雅关闭：通知 DefaultFuture 通道关闭，并等待一段时间让未完成的请求完成
             DefaultFuture.closeChannel(channel, ConfigurationUtils.reCalShutdownTime(shutdownTimeout));
         } catch (Exception e) {
             logger.warn(TRANSPORT_FAILED_CLOSE, "", "", e.getMessage(), e);
         }
 
         try {
+            // 关闭底层 Channel
             channel.close();
         } catch (Exception e) {
             logger.warn(TRANSPORT_FAILED_CLOSE, "", "", e.getMessage(), e);
@@ -213,6 +266,12 @@ final class HeaderExchangeChannel implements ExchangeChannel {
     }
 
     // graceful close
+    /**
+     * 优雅关闭通道，在指定的超时时间内等待所有待处理的请求完成。
+     * 该方法会轮询检查是否还有未完成的 Future，直到超时或所有请求完成。
+     *
+     * @param timeout 等待的超时时间（毫秒）
+     */
     @Override
     public void close(int timeout) {
         if (closed) {
@@ -220,6 +279,7 @@ final class HeaderExchangeChannel implements ExchangeChannel {
         }
         if (timeout > 0) {
             long start = System.currentTimeMillis();
+            // 循环等待，直到没有未完成的 Future 或者超时
             while (DefaultFuture.hasFuture(channel) && System.currentTimeMillis() - start < timeout) {
                 try {
                     Thread.sleep(10);
@@ -228,6 +288,7 @@ final class HeaderExchangeChannel implements ExchangeChannel {
                 }
             }
         }
+        // 执行最终的关闭操作
         close();
     }
 

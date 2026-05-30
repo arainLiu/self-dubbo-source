@@ -23,6 +23,8 @@ import org.apache.dubbo.springboot.demo.DemoService;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 
+import org.apache.dubbo.springboot.demo.model.HelloDTO;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.SpringApplication;
@@ -36,28 +38,39 @@ import org.springframework.stereotype.Service;
 public class ConsumerApplication {
     private static final Logger logger = LoggerFactory.getLogger(ConsumerApplication.class);
 
-    @DubboReference
+    @DubboReference(timeout = 30000000)
     private DemoService demoService;
 
     public static void main(String[] args) {
 
         ConfigurableApplicationContext context = SpringApplication.run(ConsumerApplication.class, args);
         ConsumerApplication application = context.getBean(ConsumerApplication.class);
-        String result = application.doSayHello("world");
-        logger.info("result: {}", result);
 
-        CompletableFuture<String> future = application.doSayHelloAsync("world");
-        try {
-            logger.info("async call returned: {}", future.get());
-        } catch (InterruptedException e) {
-            throw new RuntimeException(e);
-        } catch (ExecutionException e) {
-            throw new RuntimeException(e);
+        for (int i = 0; i < 10000; i++) {
+            try {
+                String result = application.doSayHello("你好世界", String.valueOf(i));
+                logger.info("result: {}", result);
+                Thread.sleep(5000);
+            } catch (Exception e) {
+                logger.info("invoke error: {}", i, e);
+            }
         }
+//
+//        CompletableFuture<String> future = application.doSayHelloAsync("world");
+//        try {
+//            logger.info("async call returned: {}", future.get());
+//        } catch (InterruptedException e) {
+//            throw new RuntimeException(e);
+//        } catch (ExecutionException e) {
+//            throw new RuntimeException(e);
+//        }
     }
 
-    public String doSayHello(String name) {
-        return demoService.sayHello(name);
+    public String doSayHello(String name, String index) {
+        HelloDTO helloDTO = new HelloDTO();
+        helloDTO.setMessage(index);
+        helloDTO.setName(name);
+        return demoService.sayHello(helloDTO);
     }
 
     public CompletableFuture<String> doSayHelloAsync(String name) {

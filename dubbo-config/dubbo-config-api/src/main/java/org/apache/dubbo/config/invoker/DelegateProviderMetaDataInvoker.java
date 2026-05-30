@@ -25,11 +25,26 @@ import org.apache.dubbo.rpc.RpcException;
 
 /**
  * An invoker wrapper that wrap the invoker and all the metadata (ServiceConfig)
+ * 提供者元数据委托 Invoker。
+ * 该类包装了底层的 Invoker 实例以及对应的 ServiceConfig 配置对象。
+ *
+ * 主要作用：
+ * 1. 在导出服务时，将服务配置元数据（ServiceConfig）与 Invoker 绑定在一起
+ * 2. 方便后续在注册中心发布服务或处理治理规则时，能够直接从 Invoker 中获取完整的配置信息
+ * 3. 作为配置层与协议层之间的桥梁，确保元数据能够随 Invoker 链路传递
+ *
+ * @param <T> 服务接口类型
  */
 public class DelegateProviderMetaDataInvoker<T> implements Invoker {
     protected final Invoker<T> invoker;
     private final ServiceConfig<?> metadata;
 
+    /**
+     * 构造 DelegateProviderMetaDataInvoker 实例。
+     *
+     * @param invoker 被包装的底层 Invoker 实例
+     * @param metadata 服务配置元数据，包含服务的各种配置参数
+     */
     public DelegateProviderMetaDataInvoker(Invoker<T> invoker, ServiceConfig<?> metadata) {
         this.invoker = invoker;
         this.metadata = metadata;
@@ -60,6 +75,11 @@ public class DelegateProviderMetaDataInvoker<T> implements Invoker {
         invoker.destroy();
     }
 
+    /**
+     * 获取服务配置元数据。
+     *
+     * @return ServiceConfig 配置对象，包含服务的分组、版本、超时时间等配置信息
+     */
     public ServiceConfig<?> getMetadata() {
         return metadata;
     }

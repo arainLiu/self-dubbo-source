@@ -305,23 +305,37 @@ public class ServiceInstancesChangedListener {
         }
     }
 
+    /**
+     * 添加通知监听器并立即触发一次地址聚合通知
+     * 该方法用于在服务订阅阶段注册监听器，并确保消费者能立即获取到当前可用的服务地址列表
+     *
+     * @param url 订阅的服务URL，包含接口名、版本、分组等标识信息
+     * @param listener 通知监听器，当服务地址发生变更时接收回调
+     */
     public synchronized void addListenerAndNotify(URL url, NotifyListener listener) {
+        // 如果监听器已销毁，则直接返回不再处理
         if (destroyed.get()) {
             return;
         }
 
+        // 根据服务键（ServiceKey）获取或创建对应的监听器集合，确保同一服务的多个监听器能被统一管理
         Set<NotifyListenerWithKey> notifyListeners = ConcurrentHashMapUtils.computeIfAbsent(
                 this.listeners, url.getServiceKey(), _k -> new ConcurrentHashSet<>());
+
+        // 提取协议信息并构建协议服务键，用于精确匹配特定协议下的服务实例
         String protocol = listener.getConsumerUrl().getParameter(PROTOCOL_KEY, url.getProtocol());
         ProtocolServiceKey protocolServiceKey = new ProtocolServiceKey(
                 url.getServiceInterface(),
                 url.getVersion(),
                 url.getGroup(),
                 !CommonConstants.CONSUMER.equals(protocol) ? protocol : null);
+
+        // 封装监听器与协议服务键，存入集合中
         NotifyListenerWithKey listenerWithKey = new NotifyListenerWithKey(protocolServiceKey, listener);
         notifyListeners.add(listenerWithKey);
 
         // Aggregate address and notify on subscription.
+        // 聚合当前所有可用的服务地址，并在订阅时立即通知监听器，实现“订阅即发现”
         List<URL> urls = getAddresses(protocolServiceKey, listener.getConsumerUrl());
 
         if (CollectionUtils.isNotEmpty(urls)) {
@@ -331,6 +345,7 @@ public class ServiceInstancesChangedListener {
             listener.notify(urls);
         }
     }
+
 
     public synchronized void removeListener(String serviceKey, NotifyListener notifyListener) {
         if (destroyed.get()) {
@@ -448,16 +463,30 @@ public class ServiceInstancesChangedListener {
         return emptyMetadataNum;
     }
 
+    /**
+     * 解析元数据信息，建立服务信息与版本号（Revision）之间的映射关系
+     * 将当前实例上报的所有服务接口关联到指定的Revision，用于后续的版本比对和变更检测
+     *
+     * @param revision 当前实例的元数据版本号
+     * @param metadata 从远程获取的应用级元数据对象，包含该应用下所有服务的详细信息
+     * @param localServiceToRevisions 本地维护的服务到Revision集合的映射表，该方法会向其中追加新的映射关系
+     * @return 更新后的服务到Revision集合的映射表
+     */
     protected Map<ServiceInfo, Set<String>> parseMetadata(
             String revision, MetadataInfo metadata, Map<ServiceInfo, Set<String>> localServiceToRevisions) {
+        // 获取元数据中包含的所有服务信息
         Map<String, ServiceInfo> serviceInfos = metadata.getServices();
+
+        // 遍历所有服务，将当前Revision添加到对应服务的版本集合中
         for (Map.Entry<String, ServiceInfo> entry : serviceInfos.entrySet()) {
+            // 如果该服务尚未在映射表中，则创建一个新的TreeSet来存储其关联的Revisions
             Set<String> set = localServiceToRevisions.computeIfAbsent(entry.getValue(), _k -> new TreeSet<>());
             set.add(revision);
         }
 
         return localServiceToRevisions;
     }
+
 
     protected Object getServiceUrlsCache(
             Map<String, List<ServiceInstance>> revisionToInstances, Set<String> revisions, String protocol, int port) {
